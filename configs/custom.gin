@@ -1,0 +1,21 @@
+Config.exp_name = 'test'
+Config.dataset_loader = 'blender'
+Config.near = 2
+Config.far = 6
+Config.factor = 0
+Config.hash_decay_mults = 10
+
+Config.batch_size = 32768
+Config.render_chunk_size = 32768
+Config.max_steps = 80000
+Config.lr_delay_steps = 10000
+Config.lr_init = 0.005
+Config.lr_final = 0.0005
+
+Model.raydist_fn = None
+
+PropMLP.disable_density_normals = True
+PropMLP.disable_rgb = True
+PropMLP.grid_level_dim = 1
+
+NerfMLP.disable_density_normals = True
