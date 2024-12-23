@@ -235,7 +235,7 @@ class Dataset(torch.utils.data.Dataset):
 
         # Initialize attributes
         self._patch_size = max(config.patch_size, 1)
-        self._batch_size = config.batch_size // config.world_size
+        self._batch_size = config.batch_size
         if self._patch_size ** 2 > self._batch_size:
             raise ValueError(f'Patch size {self._patch_size}^2 too large for ' +
                              f'per-process batch size {self._batch_size}')
@@ -248,8 +248,6 @@ class Dataset(torch.utils.data.Dataset):
         self._render_spherical = False
 
         self.config = config
-        self.global_rank = config.global_rank
-        self.world_size = config.world_size
         self.split = utils.DataSplit(split)
         self.data_dir = data_dir
         self.near = config.near
@@ -651,7 +649,7 @@ class LLFF(Dataset):
             colmap_to_image = dict(zip(colmap_files, image_files))
             image_paths = [os.path.join(image_dir, colmap_to_image[f])
                            for f in image_names]
-            images = [utils.load_img(x) for x in tqdm(image_paths, desc='Loading LLFF dataset', disable=self.global_rank != 0, leave=False)]
+            images = [utils.load_img(x) for x in tqdm(image_paths, desc='Loading LLFF dataset', leave=False)]
             images = np.stack(images, axis=0) / 255.
 
             # EXIF data is usually only present in the original JPEG images.
@@ -937,10 +935,7 @@ class Multicam(Dataset):
             self._next_fn = self._next_test
 
     def _generate_rays(self):
-        if self.global_rank == 0:
-            tbar = tqdm(range(len(self.camtoworlds)), desc='Generating rays', leave=False)
-        else:
-            tbar = range(len(self.camtoworlds))
+        tbar = tqdm(range(len(self.camtoworlds)), desc='Generating rays', leave=False)
 
         self.batches = defaultdict(list)
         for cam_idx in tbar:
@@ -997,20 +992,3 @@ class Multicam(Dataset):
 
 class MultiLLFF(Multicam, LLFF):
     pass
-
-
-if __name__ == '__main__':
-    from internal import configs
-    import accelerate
-
-    config = configs.Config()
-    accelerator = accelerate.Accelerator()
-    config.world_size = accelerator.num_processes
-    config.global_rank = accelerator.process_index
-    config.factor = 8
-    dataset = LLFF('test', '/SSD_DISK/datasets/360_v2/bicycle', config)
-    print(len(dataset))
-    for _ in tqdm(dataset):
-        pass
-    print('done')
-    # print(accelerator.process_index)

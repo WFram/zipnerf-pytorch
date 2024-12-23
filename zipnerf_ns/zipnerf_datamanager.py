@@ -38,12 +38,11 @@ class ZipNerfDataManager(VanillaDataManager):
         config: ZipNerfDataManagerConfig,
         device: Union[torch.device, str] = "cpu",
         test_mode: Literal["test", "val", "inference"] = "val",
-        world_size: int = 1,
         local_rank: int = 0,
         **kwargs,  # pylint: disable=unused-argument
     ):
         super().__init__(
-            config=config, device=device, test_mode=test_mode, world_size=world_size, local_rank=local_rank, **kwargs
+            config=config, device=device, test_mode=test_mode, local_rank=local_rank, **kwargs
         )
 
     def next_train(self, step: int) -> Tuple[RayBundle, Dict]:

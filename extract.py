@@ -13,7 +13,6 @@ from internal import utils
 from internal import coord
 from internal import checkpoints
 import torch
-import accelerate
 from tqdm import tqdm
 from torch.utils._pytree import tree_map
 import torch.nn.functional as F
@@ -25,7 +24,7 @@ configs.define_common_flags()
 
 
 @torch.no_grad()
-def evaluate_density(model, accelerator: accelerate.Accelerator,
+def evaluate_density(model,
                      points, config: configs.Config, std_value=0.0):
     """
     Evaluate a signed distance function (SDF) for a batch of points.
@@ -39,33 +38,19 @@ def evaluate_density(model, accelerator: accelerate.Accelerator,
         A torch tensor with the SDF values evaluated at the given points.
     """
     z = []
-    for _, pnts in enumerate(tqdm(torch.split(points, config.render_chunk_size, dim=0),
-                                  desc="Evaluating density", leave=False,
-                                  disable=not accelerator.is_main_process)):
-        rays_remaining = pnts.shape[0] % accelerator.num_processes
-        if rays_remaining != 0:
-            padding = accelerator.num_processes - rays_remaining
-            pnts = torch.cat([pnts, torch.zeros_like(pnts[-padding:])], dim=0)
-        else:
-            padding = 0
-        rays_per_host = pnts.shape[0] // accelerator.num_processes
-        start, stop = accelerator.process_index * rays_per_host, \
-                      (accelerator.process_index + 1) * rays_per_host
-        chunk_means = pnts[start:stop]
-        chunk_stds = torch.full_like(chunk_means[..., 0], std_value)
-        raw_density = model.nerf_mlp.predict_density(chunk_means[:, None], chunk_stds[:, None], no_warp=True)[0]
+    for _, means in enumerate(tqdm(torch.split(points, config.render_chunk_size, dim=0),
+                                  desc="Evaluating density", leave=False)):
+        stds = torch.full_like(means[..., 0], std_value)
+        raw_density = model.nerf_mlp.predict_density(means[:, None], stds[:, None], no_warp=True)[0]
         density = F.softplus(raw_density + model.nerf_mlp.density_bias)
-        density = accelerator.gather(density)
-        if padding > 0:
-            density = density[: -padding]
         z.append(density)
     z = torch.cat(z, dim=0)
     return z
 
 
 @torch.no_grad()
-def evaluate_color(model, accelerator: accelerate.Accelerator,
-                   points, config: configs.Config, std_value=0.0):
+def evaluate_color(model, points, 
+                   config: configs.Config, std_value=0.0):
     """
     Evaluate a signed distance function (SDF) for a batch of points.
 
@@ -79,33 +64,19 @@ def evaluate_color(model, accelerator: accelerate.Accelerator,
     """
     z = []
     for _, pnts in enumerate(tqdm(torch.split(points, config.render_chunk_size, dim=0),
-                                  desc="Evaluating color",
-                                  disable=not accelerator.is_main_process)):
-        rays_remaining = pnts.shape[0] % accelerator.num_processes
-        if rays_remaining != 0:
-            padding = accelerator.num_processes - rays_remaining
-            pnts = torch.cat([pnts, torch.zeros_like(pnts[-padding:])], dim=0)
-        else:
-            padding = 0
-        rays_per_host = pnts.shape[0] // accelerator.num_processes
-        start, stop = accelerator.process_index * rays_per_host, \
-                      (accelerator.process_index + 1) * rays_per_host
-        chunk_means = pnts[start:stop]
-        chunk_stds = torch.full_like(chunk_means[..., 0], std_value)
-        chunk_viewdirs = torch.zeros_like(chunk_means)
-        ray_results = model.nerf_mlp(False, chunk_means[:, None, None], chunk_stds[:, None, None],
+                                  desc="Evaluating color")):
+        chunk_stds = torch.full_like(pnts[..., 0], std_value)
+        chunk_viewdirs = torch.zeros_like(pnts)
+        ray_results = model.nerf_mlp(False, pnts[:, None, None], chunk_stds[:, None, None],
                                      chunk_viewdirs)
         rgb = ray_results['rgb'][:, 0]
-        rgb = accelerator.gather(rgb)
-        if padding > 0:
-            rgb = rgb[: -padding]
         z.append(rgb)
     z = torch.cat(z, dim=0)
     return z
 
 
 @torch.no_grad()
-def evaluate_color_projection(model, accelerator: accelerate.Accelerator, vertices, faces, config: configs.Config):
+def evaluate_color_projection(model, vertices, faces, config: configs.Config):
     normals = auto_normals(vertices, faces.long())
     viewdirs = -normals
     origins = vertices - 0.005 * viewdirs
@@ -114,18 +85,10 @@ def evaluate_color_projection(model, accelerator: accelerate.Accelerator, vertic
     model.num_levels = 1
     model.opaque_background = True
     for i in tqdm(range(0, origins.shape[0], chunk),
-                  desc="Evaluating color projection",
-                  disable=not accelerator.is_main_process):
-        cur_chunk = min(chunk, origins.shape[0] - i)
-        rays_remaining = cur_chunk % accelerator.num_processes
-        rays_per_host = cur_chunk // accelerator.num_processes
-        if rays_remaining != 0:
-            padding = accelerator.num_processes - rays_remaining
-            rays_per_host += 1
-        else:
-            padding = 0
-        start = i + accelerator.process_index * rays_per_host
-        stop = start + rays_per_host
+                  desc="Evaluating color projection"):
+        cur_chunk = min(i + chunk, origins.shape[0] - i)
+        start = i
+        stop = cur_chunk
 
         batch = {
             'origins': origins[start:stop],
@@ -136,23 +99,21 @@ def evaluate_color_projection(model, accelerator: accelerate.Accelerator, vertic
             'near': torch.full_like(origins[start:stop, ..., :1], 0),
             'far': torch.full_like(origins[start:stop, ..., :1], 0.01),
         }
-        batch = accelerator.pad_across_processes(batch)
-        with accelerator.autocast():
-            renderings, ray_history = model(
-                False,
-                batch,
-                compute_extras=False,
-                train_frac=1)
+        
+        renderings, ray_history = model(
+            False,
+            batch,
+            compute_extras=False,
+            train_frac=1)
+        
         rgb = renderings[-1]['rgb']
         acc = renderings[-1]['acc']
 
         rgb /= acc.clamp_min(1e-5)[..., None]
         rgb = rgb.clamp(0, 1)
 
-        rgb = accelerator.gather(rgb)
         rgb[torch.isnan(rgb) | torch.isinf(rgb)] = 1
-        if padding > 0:
-            rgb = rgb[: -padding]
+        
         vc.append(rgb)
     vc = torch.cat(vc, dim=0)
     return vc
@@ -296,9 +257,7 @@ def main(unused_argv):
     config.checkpoint_dir = os.path.join(config.exp_path, 'checkpoints')
     os.makedirs(config.mesh_path, exist_ok=True)
 
-    # accelerator for DDP
-    accelerator = accelerate.Accelerator()
-    device = accelerator.device
+    device = config.device
 
     # setup logger
     logging.basicConfig(
@@ -310,25 +269,17 @@ def main(unused_argv):
         level=logging.INFO,
     )
     sys.excepthook = utils.handle_exception
-    logger = accelerate.logging.get_logger(__name__)
-    logger.info(config)
-    logger.info(accelerator.state, main_process_only=False)
-
-    config.world_size = accelerator.num_processes
-    config.global_rank = accelerator.process_index
-    accelerate.utils.set_seed(config.seed, device_specific=True)
 
     # setup model and optimizer
     model = models.Model(config=config)
-    model = accelerator.prepare(model)
-    step = checkpoints.restore_checkpoint(config.checkpoint_dir, accelerator, logger)
+    model = model.to(device)
+    step, model, _ = checkpoints.restore_checkpoint(config.checkpoint_dir, model, optimizer=None)
     model.eval()
-    module = accelerator.unwrap_model(model)
 
     visibility_path = os.path.join(config.mesh_path, 'visibility_mask_{:.1f}.pt'.format(config.mesh_radius))
     visibility_resolution = config.visibility_resolution
     if not os.path.exists(visibility_path):
-        logger.info('Generate visibility mask...')
+        logging.info('Generate visibility mask...')
         # load dataset
         dataset = datasets.load_dataset('train', config.data_dir, config)
         dataloader = torch.utils.data.DataLoader(np.arange(len(dataset)),
@@ -343,12 +294,11 @@ def main(unused_argv):
             (1, 1, visibility_resolution, visibility_resolution, visibility_resolution), requires_grad=True
         ).to(device)
         visibility_mask.retain_grad()
-        tbar = tqdm(dataloader, desc='Generating visibility grid', disable=not accelerator.is_main_process)
+        tbar = tqdm(dataloader, desc='Generating visibility grid')
         for index, batch in enumerate(tbar):
-            batch = accelerate.utils.send_to_device(batch, accelerator.device)
+            batch = tree_map(lambda x: x.to(device) if x is not None else None, batch)
 
-            rendering = models.render_image(model, accelerator,
-                                            batch, False, 1, config,
+            rendering = models.render_image(model, batch, False, 1, config,
                                             verbose=False, return_weights=True)
 
             coords = rendering['coord'].reshape(-1, 3)
@@ -366,15 +316,14 @@ def main(unused_argv):
             # if index == 10:
             #     break
         visibility_mask = (visibility_mask.grad > 0.0001).float()
-        if accelerator.is_main_process:
-            torch.save(visibility_mask.detach().cpu(), visibility_path)
+        torch.save(visibility_mask.detach().cpu(), visibility_path)
     else:
-        logger.info('Load visibility mask from {}'.format(visibility_path))
+        logging.info('Load visibility mask from {}'.format(visibility_path))
         visibility_mask = torch.load(visibility_path, map_location=device)
 
     space = config.mesh_radius * 2 / (config.visibility_resolution - 1)
 
-    logger.info("Extract mesh from visibility mask...")
+    logging.info("Extract mesh from visibility mask...")
     visibility_mask_np = visibility_mask[0, 0].permute(2, 1, 0).detach().cpu().numpy()
     verts, faces, normals, values = measure.marching_cubes(
         volume=-visibility_mask_np,
@@ -384,7 +333,7 @@ def main(unused_argv):
     if config.extract_visibility:
         meshexport = trimesh.Trimesh(verts, faces)
         meshexport.export(os.path.join(config.mesh_path, "visibility_mask_{}.ply".format(config.mesh_radius)), "ply")
-    logger.info("Extract visibility mask done.")
+    logging.info("Extract visibility mask done.")
 
     # Initialize variables
     crop_n = 512
@@ -404,7 +353,7 @@ def main(unused_argv):
     for i in range(Nx):
         for j in range(Ny):
             for k in range(Nz):
-                logger.info(f"Process grid cell ({i + 1}/{Nx}, {j + 1}/{Ny}, {k + 1}/{Nz})...")
+                logging.info(f"Process grid cell ({i + 1}/{Nx}, {j + 1}/{Ny}, {k + 1}/{Nz})...")
                 # Calculate grid cell boundaries
                 x_min, x_max = xs[i], xs[i + 1]
                 y_min, y_max = ys[j], ys[j + 1]
@@ -424,7 +373,7 @@ def main(unused_argv):
                 current_mask = torch.nn.functional.grid_sample(visibility_mask, points_tmp, align_corners=True)
                 current_mask = (current_mask > 0.0).cpu().numpy()[0, 0]
 
-                pts_density = evaluate_density(module, accelerator, points,
+                pts_density = evaluate_density(model, points,
                                                config, std_value=config.std_value)
 
                 # bound the vertices
@@ -443,7 +392,7 @@ def main(unused_argv):
 
                 if not (np.min(z) > config.isosurface_threshold or np.max(z) < config.isosurface_threshold):
                     # Extract mesh
-                    logger.info('Extract mesh...')
+                    logging.info('Extract mesh...')
                     z = z.astype(np.float32)
                     verts, faces, _, _ = measure.marching_cubes(
                         volume=-z.reshape(crop_n_x, crop_n_y, crop_n_z),
@@ -458,22 +407,21 @@ def main(unused_argv):
                     verts = verts + np.array([x_min, y_min, z_min])
 
                     meshcrop = trimesh.Trimesh(verts, faces)
-                    logger.info('Extract vertices: {}, faces: {}'.format(meshcrop.vertices.shape[0],
+                    logging.info('Extract vertices: {}, faces: {}'.format(meshcrop.vertices.shape[0],
                                                                          meshcrop.faces.shape[0]))
                     meshes.append(meshcrop)
     # Save mesh
-    logger.info('Concatenate mesh...')
+    logging.info('Concatenate mesh...')
     combined_mesh = trimesh.util.concatenate(meshes)
 
     # from https://github.com/ashawkey/stable-dreamfusion/blob/main/nerf/renderer.py
     # clean
-    logger.info('Clean mesh...')
+    logging.info('Clean mesh...')
     vertices = combined_mesh.vertices.astype(np.float32)
     faces = combined_mesh.faces.astype(np.int32)
 
     vertices, faces = clean_mesh(vertices, faces,
-                                 remesh=False, remesh_size=0.01,
-                                 logger=logger, main_process=accelerator.is_main_process)
+                                 remesh=False, remesh_size=0.01)
 
     v = torch.from_numpy(vertices).contiguous().float().to(device)
     v = coord.inv_contract(2 * v)
@@ -482,29 +430,28 @@ def main(unused_argv):
 
     # decimation
     if config.decimate_target > 0 and faces.shape[0] > config.decimate_target:
-        logger.info('Decimate mesh...')
-        vertices, triangles = decimate_mesh(vertices, faces, config.decimate_target, logger=logger)
+        logging.info('Decimate mesh...')
+        vertices, triangles = decimate_mesh(vertices, faces, config.decimate_target)
     # import ipdb; ipdb.set_trace()
     if config.vertex_color:
         # batched inference to avoid OOM
-        logger.info('Evaluate mesh vertex color...')
+        logging.info('Evaluate mesh vertex color...')
         if config.vertex_projection:
-            rgbs = evaluate_color_projection(module, accelerator, v, f, config)
+            rgbs = evaluate_color_projection(model, v, f, config)
         else:
-            rgbs = evaluate_color(module, accelerator, v,
+            rgbs = evaluate_color(model, v,
                                   config, std_value=config.std_value)
         rgbs = (rgbs * 255).detach().cpu().numpy().astype(np.uint8)
-        if accelerator.is_main_process:
-            logger.info('Export mesh (vertex color)...')
-            mesh = trimesh.Trimesh(vertices, faces,
-                                   vertex_colors=rgbs,
-                                   process=False)  # important, process=True leads to seg fault...
-            mesh.export(os.path.join(config.mesh_path, 'mesh_{}.ply'.format(config.mesh_radius)))
-        logger.info('Finish extracting mesh.')
+        logging.info('Export mesh (vertex color)...')
+        mesh = trimesh.Trimesh(vertices, faces,
+                               vertex_colors=rgbs,
+                               process=False)  # important, process=True leads to seg fault...
+        mesh.export(os.path.join(config.mesh_path, 'mesh_{}.ply'.format(config.mesh_radius)))
+        logging.info('Finish extracting mesh.')
         return
 
     def _export(v, f, h0=2048, w0=2048, ssaa=1, name=''):
-        logger.info('Export mesh (atlas)...')
+        logging.info('Export mesh (atlas)...')
         # v, f: torch Tensor
         device = v.device
         v_np = v.cpu().numpy()  # [N, 3]
@@ -516,7 +463,7 @@ def main(unused_argv):
         from sklearn.neighbors import NearestNeighbors
         from scipy.ndimage import binary_dilation, binary_erosion
 
-        logger.info(f'Running xatlas to unwrap UVs for mesh: v={v_np.shape} f={f_np.shape}')
+        logging.info(f'Running xatlas to unwrap UVs for mesh: v={v_np.shape} f={f_np.shape}')
         atlas = xatlas.Atlas()
         atlas.add_mesh(v_np, f_np)
         chart_options = xatlas.ChartOptions()
@@ -558,7 +505,7 @@ def main(unused_argv):
             xyzs = xyzs[mask]  # [M, 3]
 
             # batched inference to avoid OOM
-            all_feats = evaluate_color(module, accelerator, xyzs,
+            all_feats = evaluate_color(model, xyzs,
                                        config, std_value=config.std_value)
             feats[mask] = all_feats
 
@@ -599,19 +546,19 @@ def main(unused_argv):
         obj_file = os.path.join(config.mesh_path, f'{name}mesh.obj')
         mtl_file = os.path.join(config.mesh_path, f'{name}mesh.mtl')
 
-        logger.info(f'writing obj mesh to {obj_file}')
+        logging.info(f'writing obj mesh to {obj_file}')
         with open(obj_file, "w") as fp:
             fp.write(f'mtllib {name}mesh.mtl \n')
 
-            logger.info(f'writing vertices {v_np.shape}')
+            logging.info(f'writing vertices {v_np.shape}')
             for v in v_np:
                 fp.write(f'v {v[0]} {v[1]} {v[2]} \n')
 
-            logger.info(f'writing vertices texture coords {vt_np.shape}')
+            logging.info(f'writing vertices texture coords {vt_np.shape}')
             for v in vt_np:
                 fp.write(f'vt {v[0]} {1 - v[1]} \n')
 
-            logger.info(f'writing faces {f_np.shape}')
+            logging.info(f'writing faces {f_np.shape}')
             fp.write(f'usemtl mat0 \n')
             for i in range(len(f_np)):
                 fp.write(
@@ -630,7 +577,7 @@ def main(unused_argv):
     # could be extremely slow
     _export(v, f)
 
-    logger.info('Finish extracting mesh.')
+    logging.info('Finish extracting mesh.')
 
 
 if __name__ == '__main__':

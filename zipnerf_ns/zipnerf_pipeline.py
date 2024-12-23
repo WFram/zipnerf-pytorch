@@ -47,7 +47,6 @@ class ZipNerfPipeline(VanillaPipeline):
         config: ZipNerfPipelineConfig,
         device: str,
         test_mode: Literal["test", "val", "inference"] = "val",
-        world_size: int = 1,
         local_rank: int = 0,
         grad_scaler: Optional[GradScaler] = None,
     ):
@@ -55,7 +54,7 @@ class ZipNerfPipeline(VanillaPipeline):
         self.config = config
         self.test_mode = test_mode
         self.datamanager: DataManager = config.datamanager.setup(
-            device=device, test_mode=test_mode, world_size=world_size, local_rank=local_rank
+            device=device, test_mode=test_mode, local_rank=local_rank
         )
         self.datamanager.to(device)
 
@@ -68,10 +67,3 @@ class ZipNerfPipeline(VanillaPipeline):
             grad_scaler=grad_scaler,
         )
         self.model.to(device)
-
-        self.world_size = world_size
-        if world_size > 1:
-            self._model = typing.cast(
-                ZipNerfModel, DDP(self._model, device_ids=[local_rank], find_unused_parameters=True)
-            )
-            dist.barrier(device_ids=[local_rank])
