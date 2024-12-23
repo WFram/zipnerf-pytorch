@@ -475,7 +475,8 @@ class Blender(Dataset):
         disp_images = []
         normal_images = []
         cams = []
-        for idx, frame in enumerate(tqdm(meta['frames'], desc='Loading Blender dataset', disable=self.global_rank != 0, leave=False)):
+        mean_camera_angle_x = np.mean(np.array([frame['camera_angle_x'] for frame in meta['frames']]))
+        for idx, frame in enumerate(tqdm(meta['frames'], desc='Loading Blender dataset', leave=False)):
             fprefix = os.path.join(self.data_dir, frame['file_path'])
 
             def get_img(f, fprefix=fprefix):
@@ -512,7 +513,7 @@ class Blender(Dataset):
         self.images = rgb * alpha + (1. - alpha)  # Use a white background.
         self.height, self.width = self.images.shape[1:3]
         self.camtoworlds = np.stack(cams, axis=0)
-        self.focal = .5 * self.width / np.tan(.5 * float(meta['camera_angle_x']))
+        self.focal = .5 * self.width / np.tan(.5 * float(mean_camera_angle_x))
         self.pixtocams = camera_utils.get_pixtocam(self.focal, self.width,
                                                    self.height)
 
