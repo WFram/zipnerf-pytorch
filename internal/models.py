@@ -425,33 +425,33 @@ class MLP(nn.Module):
                                          not self.disable_density_normals):
             raise ValueError('Normals must be computed for reflection directions.')
 
-        # Precompute and define viewdir or refdir encoding function.
-        if self.use_directional_enc:
-            self.dir_enc_fn = ref_utils.generate_ide_fn(self.deg_view)
-            dim_dir_enc = self.dir_enc_fn(torch.zeros(1, 3), torch.zeros(1, 1)).shape[-1]
-        else:
-
-            def dir_enc_fn(direction, _):
-                return coord.pos_enc(
-                    direction, min_deg=0, max_deg=self.deg_view, append_identity=True)
-
-            self.dir_enc_fn = dir_enc_fn
-            dim_dir_enc = self.dir_enc_fn(torch.zeros(1, 3), None).shape[-1]
-        self.grid_num_levels = int(
-            np.log(self.grid_disired_resolution / self.grid_base_resolution) / np.log(self.grid_level_interval)) + 1
-        self.encoder = GridEncoder(input_dim=3,
-                                   num_levels=self.grid_num_levels,
-                                   level_dim=self.grid_level_dim,
-                                   base_resolution=self.grid_base_resolution,
-                                   desired_resolution=self.grid_disired_resolution,
-                                   log2_hashmap_size=self.grid_log2_hashmap_size,
-                                   gridtype='hash',
-                                   align_corners=False)
-        last_dim = self.encoder.output_dim
-        if self.scale_featurization:
-            last_dim += self.encoder.num_levels
-        
         if not self.use_fully_fused_mlp:
+            # Precompute and define viewdir or refdir encoding function.
+            if self.use_directional_enc:
+                self.dir_enc_fn = ref_utils.generate_ide_fn(self.deg_view)
+                dim_dir_enc = self.dir_enc_fn(torch.zeros(1, 3), torch.zeros(1, 1)).shape[-1]
+            else:
+
+                def dir_enc_fn(direction, _):
+                    return coord.pos_enc(
+                        direction, min_deg=0, max_deg=self.deg_view, append_identity=True)
+
+                self.dir_enc_fn = dir_enc_fn
+                dim_dir_enc = self.dir_enc_fn(torch.zeros(1, 3), None).shape[-1]
+            self.grid_num_levels = int(
+                np.log(self.grid_disired_resolution / self.grid_base_resolution) / np.log(self.grid_level_interval)) + 1
+            self.encoder = GridEncoder(input_dim=3,
+                                    num_levels=self.grid_num_levels,
+                                    level_dim=self.grid_level_dim,
+                                    base_resolution=self.grid_base_resolution,
+                                    desired_resolution=self.grid_disired_resolution,
+                                    log2_hashmap_size=self.grid_log2_hashmap_size,
+                                    gridtype='hash',
+                                    align_corners=False)
+            last_dim = self.encoder.output_dim
+            if self.scale_featurization:
+                last_dim += self.encoder.num_levels
+        
             self.density_layer = nn.Sequential(nn.Linear(last_dim, 64),
                                                nn.ReLU(),
                                                nn.Linear(64,
@@ -500,14 +500,32 @@ class MLP(nn.Module):
                 self.rgb_layer = nn.Linear(last_dim_rgb, self.num_rgb_channels)
         else:
             ffmlp_config = load_omega_config(self.ffmlp_config)
+            rgb_config = ffmlp_config.get('rgb')
             density_mlp_config = ffmlp_config.get('density').get('mlp_network_config')
             assert self.bottleneck_width > 0
+            self.grid_num_levels = int(
+                np.log(self.grid_disired_resolution / self.grid_base_resolution) / np.log(self.grid_level_interval)) + 1
+            self.encoder = GridEncoder(input_dim=3,
+                                    num_levels=self.grid_num_levels,
+                                    level_dim=self.grid_level_dim,
+                                    base_resolution=self.grid_base_resolution,
+                                    desired_resolution=self.grid_disired_resolution,
+                                    log2_hashmap_size=self.grid_log2_hashmap_size,
+                                    gridtype='hash',
+                                    align_corners=False)
+            last_dim = self.encoder.output_dim
+            if self.scale_featurization:
+                last_dim += self.encoder.num_levels
             with torch.cuda.device(get_rank()):
                 self.density_layer_n_input_dims = last_dim
                 self.density_layer_n_output_dims = 1 if self.disable_rgb else self.bottleneck_width
                 self.density_layer = tcnn.Network(self.density_layer_n_input_dims, self.density_layer_n_output_dims, omega_config_to_primitive(density_mlp_config))
                 if not self.disable_rgb:
-                    rgb_mlp_config = ffmlp_config.get('rgb').get('mlp_network_config')
+                    rgb_mlp_config = rgb_config.get('mlp_network_config')
+                    dir_encoding_config = rgb_config.get('dir_encoding_config')
+                    dir_encoding_n_input = 3
+                    self.dir_enc_fn = tcnn.Encoding(dir_encoding_n_input, omega_config_to_primitive(dir_encoding_config))
+                    dim_dir_enc = self.dir_enc_fn(torch.zeros(1, 3).cuda()).shape[-1]
                     last_dim_rgb = self.bottleneck_width + dim_dir_enc
                     self.rgb_layer_n_input_dims = last_dim_rgb
                     self.rgb_layer_n_output_dims = self.num_rgb_channels
@@ -670,10 +688,17 @@ class MLP(nn.Module):
                     dir_enc = self.dir_enc_fn(refdirs, roughness)
                 else:
                     # Encode view directions.
-                    dir_enc = self.dir_enc_fn(viewdirs, roughness)
-                    dir_enc = torch.broadcast_to(
-                        dir_enc[..., None, :],
-                        bottleneck.shape[:-1] + (dir_enc.shape[-1],))
+                    if not self.use_fully_fused_mlp:
+                        dir_enc = self.dir_enc_fn(viewdirs, roughness)
+                        dir_enc = torch.broadcast_to(
+                            dir_enc[..., None, :],
+                            bottleneck.shape[:-1] + (dir_enc.shape[-1],))
+                    else:
+                        viewdirs_scaled = (viewdirs[:, 0, 0] + 1.) / 2.
+                        dir_enc = self.dir_enc_fn(viewdirs_scaled.view(-1, 3)).unsqueeze(1).unsqueeze(2)
+                        dir_enc = torch.broadcast_to(
+                            dir_enc[..., None, :],
+                            bottleneck.shape[:-1] + (dir_enc.shape[-1],))
 
                 # Append view (or reflection) direction encoding to bottleneck vector.
                 x.append(dir_enc)
