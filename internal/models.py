@@ -694,8 +694,12 @@ class MLP(nn.Module):
                             dir_enc[..., None, :],
                             bottleneck.shape[:-1] + (dir_enc.shape[-1],))
                     else:
-                        viewdirs_scaled = (viewdirs[:, 0, 0] + 1.) / 2.
-                        dir_enc = self.dir_enc_fn(viewdirs_scaled.view(-1, 3)).unsqueeze(1).unsqueeze(2)
+                        if len(viewdirs.shape) == 4:
+                            viewdirs_scaled = (viewdirs[:, 0, 0] + 1.) / 2.
+                            dir_enc = self.dir_enc_fn(viewdirs_scaled.view(-1, 3)).unsqueeze(1).unsqueeze(2)
+                        else:
+                            viewdirs_scaled = (viewdirs + 1.) / 2.
+                            dir_enc = self.dir_enc_fn(viewdirs_scaled.view(-1, 3))
                         dir_enc = torch.broadcast_to(
                             dir_enc[..., None, :],
                             bottleneck.shape[:-1] + (dir_enc.shape[-1],))
