@@ -12,9 +12,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import tinycudann as tcnn
+from omegaconf import OmegaConf
 from torch.utils._pytree import tree_map
 from tqdm import tqdm
 from gridencoder import GridEncoder
+from torch.autograd import Function
+from torch.cuda.amp import custom_bwd, custom_fwd
 try:
     from torch_scatter import segment_coo
 except:
@@ -331,12 +335,54 @@ class Model(nn.Module):
         return renderings, ray_history
 
 
+def get_rank():
+    import os
+    # SLURM_PROCID can be set even if SLURM is not managing the multiprocessing,
+    # therefore LOCAL_RANK needs to be checked first
+    rank_keys = ("RANK", "LOCAL_RANK", "SLURM_PROCID", "JSM_NAMESPACE_RANK")
+    for key in rank_keys:
+        rank = os.environ.get(key)
+        if rank is not None:
+            return int(rank)
+    return 0
+
+
+def load_omega_config(*yaml_files, cli_args=[]):
+    yaml_confs = [OmegaConf.load(f) for f in yaml_files]
+    cli_conf = OmegaConf.from_cli(cli_args)
+    conf = OmegaConf.merge(*yaml_confs, cli_conf)
+    OmegaConf.resolve(conf)
+    return conf
+
+
+def omega_config_to_primitive(config, resolve=True):
+    return OmegaConf.to_container(config, resolve=resolve) 
+
+
+class _TruncExp(Function):  # pylint: disable=abstract-method
+    # Implementation from torch-ngp:
+    # https://github.com/ashawkey/torch-ngp/blob/93b08a0d4ec1cc6e69d85df7f0acdfb99603b628/activation.py
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32)
+    def forward(ctx, x):  # pylint: disable=arguments-differ
+        ctx.save_for_backward(x)
+        return torch.exp(x)
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, g):  # pylint: disable=arguments-differ
+        x = ctx.saved_tensors[0]
+        return g * torch.exp(torch.clamp(x, max=15))
+
+trunc_exp = _TruncExp.apply
+
+
 class MLP(nn.Module):
     """A PosEnc MLP."""
-    bottleneck_width: int = 256  # The width of the bottleneck vector.
+    bottleneck_width: int = 128  # The width of the bottleneck vector.
     net_depth_viewdirs: int = 2  # The depth of the second part of ML.
-    net_width_viewdirs: int = 256  # The width of the second part of MLP.
-    skip_layer_dir: int = 0  # Add a skip connection to 2nd MLP after Nth layers.
+    net_width_viewdirs: int = 128  # The width of the second part of MLP.
+    skip_layer_dir: int = 1000  # Add a skip connection to 2nd MLP after Nth layers.
     num_rgb_channels: int = 3  # The number of RGB channels.
     deg_view: int = 4  # Degree of encoding for viewdirs or refdirs.
     use_reflections: bool = False  # If True, use refdirs instead of viewdirs.
@@ -368,6 +414,8 @@ class MLP(nn.Module):
     grid_log2_hashmap_size: int = 21
     net_width_glo: int = 128  # The width of the second part of MLP.
     net_depth_glo: int = 2  # The width of the second part of MLP.
+    use_fully_fused_mlp: bool = False  # Usage of fully-fused MLP.
+    ffmlp_config: str = ''  # Path to YAML file with fully-fused MLP config.
 
     def __init__(self, **kwargs):
         super().__init__()
@@ -402,52 +450,68 @@ class MLP(nn.Module):
         last_dim = self.encoder.output_dim
         if self.scale_featurization:
             last_dim += self.encoder.num_levels
-        self.density_layer = nn.Sequential(nn.Linear(last_dim, 64),
-                                           nn.ReLU(),
-                                           nn.Linear(64,
-                                                     1 if self.disable_rgb else self.bottleneck_width))  # Hardcoded to a single channel.
-        last_dim = 1 if self.disable_rgb and not self.enable_pred_normals else self.bottleneck_width
-        if self.enable_pred_normals:
-            self.normal_layer = nn.Linear(last_dim, 3)
+        
+        if not self.use_fully_fused_mlp:
+            self.density_layer = nn.Sequential(nn.Linear(last_dim, 64),
+                                               nn.ReLU(),
+                                               nn.Linear(64,
+                                                         1 if self.disable_rgb else self.bottleneck_width))  # Hardcoded to a single channel.
+            last_dim = 1 if self.disable_rgb and not self.enable_pred_normals else self.bottleneck_width
+            if self.enable_pred_normals:
+                self.normal_layer = nn.Linear(last_dim, 3)
 
-        if not self.disable_rgb:
-            if self.use_diffuse_color:
-                self.diffuse_layer = nn.Linear(last_dim, self.num_rgb_channels)
+            if not self.disable_rgb:
+                if self.use_diffuse_color:
+                    self.diffuse_layer = nn.Linear(last_dim, self.num_rgb_channels)
 
-            if self.use_specular_tint:
-                self.specular_layer = nn.Linear(last_dim, 3)
+                if self.use_specular_tint:
+                    self.specular_layer = nn.Linear(last_dim, 3)
 
-            if self.enable_pred_roughness:
-                self.roughness_layer = nn.Linear(last_dim, 1)
+                if self.enable_pred_roughness:
+                    self.roughness_layer = nn.Linear(last_dim, 1)
 
-            # Output of the first part of MLP.
-            if self.bottleneck_width > 0:
-                last_dim_rgb = self.bottleneck_width
-            else:
-                last_dim_rgb = 0
+                # Output of the first part of MLP.
+                if self.bottleneck_width > 0:
+                    last_dim_rgb = self.bottleneck_width
+                else:
+                    last_dim_rgb = 0
 
-            last_dim_rgb += dim_dir_enc
+                last_dim_rgb += dim_dir_enc
 
-            if self.use_n_dot_v:
-                last_dim_rgb += 1
+                if self.use_n_dot_v:
+                    last_dim_rgb += 1
 
-            if self.num_glo_features > 0:
-                last_dim_glo = self.num_glo_features
-                for i in range(self.net_depth_glo - 1):
-                    self.register_module(f"lin_glo_{i}", nn.Linear(last_dim_glo, self.net_width_glo))
-                    last_dim_glo = self.net_width_glo
-                self.register_module(f"lin_glo_{self.net_depth_glo - 1}",
-                                     nn.Linear(last_dim_glo, self.bottleneck_width * 2))
+                if self.num_glo_features > 0:
+                    last_dim_glo = self.num_glo_features
+                    for i in range(self.net_depth_glo - 1):
+                        self.register_module(f"lin_glo_{i}", nn.Linear(last_dim_glo, self.net_width_glo))
+                        last_dim_glo = self.net_width_glo
+                    self.register_module(f"lin_glo_{self.net_depth_glo - 1}",
+                                         nn.Linear(last_dim_glo, self.bottleneck_width * 2))
 
-            input_dim_rgb = last_dim_rgb
-            for i in range(self.net_depth_viewdirs):
-                lin = nn.Linear(last_dim_rgb, self.net_width_viewdirs)
-                torch.nn.init.kaiming_uniform_(lin.weight)
-                self.register_module(f"lin_second_stage_{i}", lin)
-                last_dim_rgb = self.net_width_viewdirs
-                if i == self.skip_layer_dir:
-                    last_dim_rgb += input_dim_rgb
-            self.rgb_layer = nn.Linear(last_dim_rgb, self.num_rgb_channels)
+                input_dim_rgb = last_dim_rgb
+                for i in range(self.net_depth_viewdirs):
+                    lin = nn.Linear(last_dim_rgb, self.net_width_viewdirs)
+                    torch.nn.init.kaiming_uniform_(lin.weight)
+                    self.register_module(f"lin_second_stage_{i}", lin)
+                    last_dim_rgb = self.net_width_viewdirs
+                    if i == self.skip_layer_dir:
+                        last_dim_rgb += input_dim_rgb
+                self.rgb_layer = nn.Linear(last_dim_rgb, self.num_rgb_channels)
+        else:
+            ffmlp_config = load_omega_config(self.ffmlp_config)
+            density_mlp_config = ffmlp_config.get('density').get('mlp_network_config')
+            assert self.bottleneck_width > 0
+            with torch.cuda.device(get_rank()):
+                self.density_layer_n_input_dims = last_dim
+                self.density_layer_n_output_dims = 1 if self.disable_rgb else self.bottleneck_width
+                self.density_layer = tcnn.Network(self.density_layer_n_input_dims, self.density_layer_n_output_dims, omega_config_to_primitive(density_mlp_config))
+                if not self.disable_rgb:
+                    rgb_mlp_config = ffmlp_config.get('rgb').get('mlp_network_config')
+                    last_dim_rgb = self.bottleneck_width + dim_dir_enc
+                    self.rgb_layer_n_input_dims = last_dim_rgb
+                    self.rgb_layer_n_output_dims = self.num_rgb_channels
+                    self.rgb_layer = tcnn.Network(self.rgb_layer_n_input_dims, self.rgb_layer_n_output_dims, omega_config_to_primitive(rgb_mlp_config))
 
     def predict_density(self, means, stds, rand=False, no_warp=False):
         """Helper function to output density."""
@@ -458,6 +522,10 @@ class MLP(nn.Module):
             bound = 2
             means = means / bound
             stds = stds / bound
+        # TODO: use the existing contraction. Create tcnn.Encoder and put your means (because they are points)
+        #       transform the result to compute weights using grid sizes (you will need to create this data structure)
+        #       recompute features
+        #       we will also have to recompute the input / output sizes for the MLP; know i/o for the encoder
         features = self.encoder(means, bound=1).unflatten(-1, (self.encoder.num_levels, -1))
         weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.encoder.grid_sizes ** 2))
         features = (features * weights[..., None]).mean(dim=-3).flatten(-2, -1)
@@ -471,7 +539,10 @@ class MLP(nn.Module):
                                       )
             featurized_w = (2 * weights.mean(dim=-2) - 1) * (self.encoder.init_std ** 2 + vl2mean).sqrt()
             features = torch.cat([features, featurized_w], dim=-1)
-        x = self.density_layer(features)
+        if self.use_fully_fused_mlp:
+            x = self.density_layer(features.view(-1, self.density_layer_n_input_dims)).view(*features.shape[:-1], self.density_layer_n_output_dims).float()
+        else:
+            x = self.density_layer(features)
         raw_density = x[..., 0]  # Hardcoded to a single channel.
         # Add noise to regularize the density predictions if needed.
         if rand and (self.density_noise > 0):
@@ -545,7 +616,10 @@ class MLP(nn.Module):
             normals_to_use = normals
 
         # Apply bias and activation to raw density
-        density = F.softplus(raw_density + self.density_bias)
+        if self.use_fully_fused_mlp:
+            density = trunc_exp(raw_density + self.density_bias)
+        else:
+            density = F.softplus(raw_density + self.density_bias)
 
         roughness = None
         if self.disable_rgb:
@@ -613,17 +687,23 @@ class MLP(nn.Module):
                 # Concatenate bottleneck, directional encoding, and GLO.
                 x = torch.cat(x, dim=-1)
                 # Output of the second part of MLP.
-                inputs = x
-                for i in range(self.net_depth_viewdirs):
-                    x = self.get_submodule(f"lin_second_stage_{i}")(x)
-                    x = F.relu(x)
-                    if i == self.skip_layer_dir:
-                        x = torch.cat([x, inputs], dim=-1)
+                if not self.use_fully_fused_mlp:
+                    inputs = x
+                    for i in range(self.net_depth_viewdirs):
+                        x = self.get_submodule(f"lin_second_stage_{i}")(x)
+                        x = F.relu(x)
+                        if i == self.skip_layer_dir:
+                            x = torch.cat([x, inputs], dim=-1)
             # If using diffuse/specular colors, then `rgb` is treated as linear
             # specular color. Otherwise it's treated as the color itself.
-            rgb = torch.sigmoid(self.rgb_premultiplier *
-                                self.rgb_layer(x) +
-                                self.rgb_bias)
+            if self.use_fully_fused_mlp:
+                rgb = torch.sigmoid(self.rgb_premultiplier *
+                                    self.rgb_layer(x.view(-1, self.rgb_layer_n_input_dims)).view(*x.shape[:-1], self.rgb_layer_n_output_dims).float() +
+                                    self.rgb_bias)
+            else:
+                rgb = torch.sigmoid(self.rgb_premultiplier *
+                                    self.rgb_layer(x) +
+                                    self.rgb_bias)
 
             if self.use_diffuse_color:
                 # Initialize linear diffuse color around 0.25, so that the combined

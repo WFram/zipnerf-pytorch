@@ -83,4 +83,8 @@ RUN bash -c "source activate zipnerf && \
     pip install torch-scatter -f https://data.pyg.org/whl/torch-2.0.0+cu117.html && \
     pip install numpy==1.24.1"
 
+RUN bash -c "source activate zipnerf && \
+    pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch && \
+    pip install omegaconf==2.2.3"
+
 COPY . .
