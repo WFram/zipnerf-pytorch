@@ -178,9 +178,10 @@ def main(unused_argv):
                     config.orientation_loss_mult > 0):
                 losses['orientation'] = train_utils.orientation_loss(batch, model, ray_history,
                                                                      config)
+            # TODO: return hash decay loss
             # hash grid l2 weight decay
-            if config.hash_decay_mults > 0:
-                losses['hash_decay'] = train_utils.hash_decay_loss(ray_history, config)
+            # if config.hash_decay_mults > 0:
+            #     losses['hash_decay'] = train_utils.hash_decay_loss(ray_history, config)
 
             # normal supervision loss in RefNeRF
             if (config.predicted_normal_coarse_loss_mult > 0 or

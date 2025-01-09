@@ -1,4 +1,10 @@
 density:
+  xyz_encoding_config:
+    otype: HashGrid
+    n_features_per_level: 1
+    log2_hashmap_size: 21
+    base_resolution: 16
+    per_level_scale: 2
   mlp_network_config:
     otype: FullyFusedMLP
     activation: ReLU

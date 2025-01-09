@@ -300,19 +300,20 @@ class Model(nn.Module):
                 rgb = ray_results['rgb']
                 rendering['ray_rgbs'] = (rgb.reshape((-1,) + rgb.shape[-2:]))[:n, :, :]
 
-            if self.training:
-                # Compute the hash decay loss for this level.
-                idx = mlp.encoder.idx
-                param = mlp.encoder.embeddings
-                if self.config.dpcpp_backend:
-                    ray_results['loss_hash_decay'] = (param ** 2).mean()
-                else:
-                    loss_hash_decay = segment_coo(param ** 2,
-                                                  idx,
-                                                  torch.zeros(idx.max() + 1, param.shape[-1], device=param.device),
-                                                  reduce='mean'
-                                                  ).mean()
-                    ray_results['loss_hash_decay'] = loss_hash_decay
+            # TODO: return hash decay loss
+            # if self.training:
+            #     # Compute the hash decay loss for this level.
+            #     idx = mlp.encoder.idx
+            #     param = mlp.encoder.embeddings
+            #     if self.config.dpcpp_backend:
+            #         ray_results['loss_hash_decay'] = (param ** 2).mean()
+            #     else:
+            #         loss_hash_decay = segment_coo(param ** 2,
+            #                                       idx,
+            #                                       torch.zeros(idx.max() + 1, param.shape[-1], device=param.device),
+            #                                       reduce='mean'
+            #                                       ).mean()
+            #         ray_results['loss_hash_decay'] = loss_hash_decay
 
             renderings.append(rendering)
             ray_results['sdist'] = sdist.clone()
@@ -500,23 +501,38 @@ class MLP(nn.Module):
                 self.rgb_layer = nn.Linear(last_dim_rgb, self.num_rgb_channels)
         else:
             ffmlp_config = load_omega_config(self.ffmlp_config)
+            density_config = ffmlp_config.get('density')
             rgb_config = ffmlp_config.get('rgb')
-            density_mlp_config = ffmlp_config.get('density').get('mlp_network_config')
+            
+            from dataclasses import dataclass
+            feature_encoding_config = density_config.get('xyz_encoding_config')
+            @dataclass
+            class XyzEncodingParams():
+                num_levels: int
+                level_dim: int
+                log2_hashmap_size: int
+                base_resolution: int
+                per_level_scale: int
+                grid_sizes: torch.Tensor = torch.from_numpy(np.array([], dtype=np.int32))
+            self.xyz_encoding_params = XyzEncodingParams(feature_encoding_config.get('n_levels', 6),
+                                                         feature_encoding_config.get('n_features_per_level'),
+                                                         feature_encoding_config.get('log2_hashmap_size'),
+                                                         feature_encoding_config.get('base_resolution'),
+                                                         feature_encoding_config.get('per_level_scale'))
+            self.xyz_encoding_params.num_levels = int(
+                np.log(self.grid_disired_resolution / self.xyz_encoding_params.base_resolution) / np.log(self.grid_level_interval)) + 1
+            feature_encoding_config['n_levels'] = self.xyz_encoding_params.num_levels
+            density_mlp_config = density_config.get('mlp_network_config')
             assert self.bottleneck_width > 0
-            self.grid_num_levels = int(
-                np.log(self.grid_disired_resolution / self.grid_base_resolution) / np.log(self.grid_level_interval)) + 1
-            self.encoder = GridEncoder(input_dim=3,
-                                    num_levels=self.grid_num_levels,
-                                    level_dim=self.grid_level_dim,
-                                    base_resolution=self.grid_base_resolution,
-                                    desired_resolution=self.grid_disired_resolution,
-                                    log2_hashmap_size=self.grid_log2_hashmap_size,
-                                    gridtype='hash',
-                                    align_corners=False)
-            last_dim = self.encoder.output_dim
-            if self.scale_featurization:
-                last_dim += self.encoder.num_levels
+            last_dim = self.xyz_encoding_params.num_levels * self.xyz_encoding_params.level_dim
+            resolutions = [int(np.ceil(self.xyz_encoding_params.base_resolution * self.xyz_encoding_params.per_level_scale ** i)) + 1 \
+                           for i in range(self.xyz_encoding_params.num_levels)]
+            self.xyz_encoding_params.grid_sizes = torch.from_numpy(np.array(resolutions, dtype=np.int32)).cuda()
             with torch.cuda.device(get_rank()):
+                self.feature_encoding_n_input = 3
+                self.encoder = tcnn.Encoding(self.feature_encoding_n_input, omega_config_to_primitive(feature_encoding_config))
+                if self.scale_featurization:
+                    last_dim += self.xyz_encoding_params.num_levels
                 self.density_layer_n_input_dims = last_dim
                 self.density_layer_n_output_dims = 1 if self.disable_rgb else self.bottleneck_width
                 self.density_layer = tcnn.Network(self.density_layer_n_input_dims, self.density_layer_n_output_dims, omega_config_to_primitive(density_mlp_config))
@@ -540,14 +556,15 @@ class MLP(nn.Module):
             bound = 2
             means = means / bound
             stds = stds / bound
-        # TODO: use the existing contraction. Create tcnn.Encoder and put your means (because they are points)
-        #       transform the result to compute weights using grid sizes (you will need to create this data structure)
-        #       recompute features
-        #       we will also have to recompute the input / output sizes for the MLP; know i/o for the encoder
-        features = self.encoder(means, bound=1).unflatten(-1, (self.encoder.num_levels, -1))
-        weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.encoder.grid_sizes ** 2))
+        if not self.use_fully_fused_mlp:
+            features = self.encoder(means, bound=1).unflatten(-1, (self.encoder.num_levels, -1))
+            weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.encoder.grid_sizes ** 2))
+        else:
+            features = self.encoder(means.view(-1, self.feature_encoding_n_input)).view(*means.shape[:-1], self.density_layer_n_input_dims).float()
+            features = features.unflatten(-1, (self.xyz_encoding_params.num_levels, -1))
+            weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.xyz_encoding_params.grid_sizes ** 2))
         features = (features * weights[..., None]).mean(dim=-3).flatten(-2, -1)
-        if self.scale_featurization:
+        if self.scale_featurization and not self.use_fully_fused_mlp:
             with torch.no_grad():
                 vl2mean = segment_coo((self.encoder.embeddings ** 2).sum(-1),
                                       self.encoder.idx,
@@ -746,8 +763,6 @@ class MLP(nn.Module):
                 # Combine specular and diffuse components and tone map to sRGB.
                 rgb = torch.clip(image.linear_to_srgb(specular_linear + diffuse_linear), 0.0, 1.0)
 
-            # Apply padding, mapping color to [-rgb_padding, 1+rgb_padding].
-            rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
 
         return dict(
             coord=means_contract,

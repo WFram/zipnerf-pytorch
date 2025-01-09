@@ -4,9 +4,10 @@ Config.near = 2
 Config.far = 6
 Config.factor = 0
 Config.hash_decay_mults = 10
+Config.train_render_every = 90000
 
-Config.batch_size = 32768
-Config.render_chunk_size = 32768
+Config.batch_size = 8192
+Config.render_chunk_size = 8192
 Config.max_steps = 80000
 Config.lr_delay_steps = 10000
 Config.lr_init = 0.005
