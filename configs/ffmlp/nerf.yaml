@@ -18,6 +18,6 @@ rgb:
   mlp_network_config:
     otype: FullyFusedMLP
     activation: ReLU
-    output_activation: Sigmoid
+    output_activation: none
     n_neurons: 128
     n_hidden_layers: 2
