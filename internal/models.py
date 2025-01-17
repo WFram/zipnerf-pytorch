@@ -519,15 +519,22 @@ class MLP(nn.Module):
                                                          feature_encoding_config.get('log2_hashmap_size'),
                                                          feature_encoding_config.get('base_resolution'),
                                                          feature_encoding_config.get('per_level_scale'))
-            self.xyz_encoding_params.num_levels = int(
-                np.log(self.grid_disired_resolution / self.xyz_encoding_params.base_resolution) / np.log(self.grid_level_interval)) + 1
-            feature_encoding_config['n_levels'] = self.xyz_encoding_params.num_levels
+            
+            # self.xyz_encoding_params.num_levels = int(
+                # np.log(self.grid_disired_resolution / self.xyz_encoding_params.base_resolution) / np.log(self.grid_level_interval)) + 1
+            # feature_encoding_config['n_levels'] = self.xyz_encoding_params.num_levels
+            # density_mlp_config = density_config.get('mlp_network_config')
+            # assert self.bottleneck_width > 0
+            # last_dim = self.xyz_encoding_params.num_levels * self.xyz_encoding_params.level_dim
+            # resolutions = [int(np.ceil(self.xyz_encoding_params.base_resolution * self.xyz_encoding_params.per_level_scale ** i)) + 1 \
+                        #    for i in range(self.xyz_encoding_params.num_levels)]
+            # self.xyz_encoding_params.grid_sizes = torch.from_numpy(np.array(resolutions, dtype=np.int32)).cuda()
+            
+            self.xyz_encoding_params.num_levels = feature_encoding_config['n_levels']
             density_mlp_config = density_config.get('mlp_network_config')
             assert self.bottleneck_width > 0
             last_dim = self.xyz_encoding_params.num_levels * self.xyz_encoding_params.level_dim
-            resolutions = [int(np.ceil(self.xyz_encoding_params.base_resolution * self.xyz_encoding_params.per_level_scale ** i)) + 1 \
-                           for i in range(self.xyz_encoding_params.num_levels)]
-            self.xyz_encoding_params.grid_sizes = torch.from_numpy(np.array(resolutions, dtype=np.int32)).cuda()
+            
             with torch.cuda.device(get_rank()):
                 self.feature_encoding_n_input = 3
                 self.encoder = tcnn.Encoding(self.feature_encoding_n_input, omega_config_to_primitive(feature_encoding_config))
@@ -562,7 +569,8 @@ class MLP(nn.Module):
         else:
             features = self.encoder(means.view(-1, self.feature_encoding_n_input)).view(*means.shape[:-1], self.density_layer_n_input_dims).float()
             features = features.unflatten(-1, (self.xyz_encoding_params.num_levels, -1))
-            weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.xyz_encoding_params.grid_sizes ** 2))
+            # weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.xyz_encoding_params.grid_sizes ** 2))
+            weights = torch.from_numpy(np.ones_like(features[..., 0].detach().cpu())).to(features.device)
         features = (features * weights[..., None]).mean(dim=-3).flatten(-2, -1)
         if self.scale_featurization and not self.use_fully_fused_mlp:
             with torch.no_grad():

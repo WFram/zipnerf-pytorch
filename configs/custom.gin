@@ -18,6 +18,7 @@ Config.distortion_loss_mult = 0
 
 Model.raydist_fn = None
 Model.num_levels = 1
+Model.num_nerf_samples = 1024
 
 PropMLP.disable_density_normals = True
 PropMLP.disable_rgb = True
