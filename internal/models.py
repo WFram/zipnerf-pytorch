@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import tinycudann as tcnn
+from nerfacc import ContractionType, OccupancyGrid, ray_marching, render_weight_from_density
 from omegaconf import OmegaConf
 from torch.utils._pytree import tree_map
 from tqdm import tqdm
@@ -30,6 +31,24 @@ gin.config.external_configurable(math.safe_exp, module='math')
 def set_kwargs(self, kwargs):
     for k, v in kwargs.items():
         setattr(self, k, v)
+
+
+class _TruncExp(Function):  # pylint: disable=abstract-method
+    # Implementation from torch-ngp:
+    # https://github.com/ashawkey/torch-ngp/blob/93b08a0d4ec1cc6e69d85df7f0acdfb99603b628/activation.py
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32)
+    def forward(ctx, x):  # pylint: disable=arguments-differ
+        ctx.save_for_backward(x)
+        return torch.exp(x)
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, g):  # pylint: disable=arguments-differ
+        x = ctx.saved_tensors[0]
+        return g * torch.exp(torch.clamp(x, max=15))
+
+trunc_exp = _TruncExp.apply
 
 
 @gin.configurable
@@ -96,6 +115,21 @@ class Model(nn.Module):
             self.exposure_scaling_offsets = nn.Embedding(max_num_exposures, 3)
             torch.nn.init.zeros_(self.exposure_scaling_offsets.weight)
 
+        # TODO: set from config
+        self.scene_radius = 5
+        self.scene_aabb = torch.as_tensor([-self.scene_radius, -self.scene_radius, -self.scene_radius, self.scene_radius, self.scene_radius, self.scene_radius], dtype=torch.float32).cuda()
+        occupancy_grid_res = [128, 128, 128]
+        contraction_type = ContractionType.AABB
+        self.occupancy_grid = [OccupancyGrid(
+            roi_aabb=self.scene_aabb,
+            resolution=occupancy_grid_res[i_level],
+            contraction_type=contraction_type
+        ).cuda() for i_level in range(self.num_levels)]
+        self.global_occupancy_grid_update_step = 0
+        self.render_step_size = [1.732 * 2 * self.scene_radius / self.num_prop_samples,
+                                 1.732 * 2 * self.scene_radius / self.num_prop_samples,
+                                 1.732 * 2 * self.scene_radius / self.num_nerf_samples]
+
     def forward(
             self,
             rand,
@@ -127,127 +161,68 @@ class Model(nn.Module):
         else:
             glo_vec = None
 
-        # Define the mapping from normalized to metric ray distance.
-        _, s_to_t = coord.construct_ray_warps(self.raydist_fn, batch['near'], batch['far'], self.power_lambda)
-
-        # Initialize the range of (normalized) distances for each ray to [0, 1],
-        # and assign that single interval a weight of 1. These distances and weights
-        # will be repeatedly updated as we proceed through sampling levels.
-        # `near_anneal_rate` can be used to anneal in the near bound at the start
-        # of training, eg. 0.1 anneals in the bound over the first 10% of training.
-        if self.near_anneal_rate is None:
-            init_s_near = 0.
-        else:
-            init_s_near = np.clip(1 - train_frac / self.near_anneal_rate, 0,
-                                  self.near_anneal_init)
-        init_s_far = 1.
-        sdist = torch.cat([
-            torch.full_like(batch['near'], init_s_near),
-            torch.full_like(batch['far'], init_s_far)
-        ], dim=-1)
-        weights = torch.ones_like(batch['near'])
-        prod_num_samples = 1
-
         ray_history = []
         renderings = []
+        assert self.num_levels == 1
         for i_level in range(self.num_levels):
             is_prop = i_level < (self.num_levels - 1)
             num_samples = self.num_prop_samples if is_prop else self.num_nerf_samples
 
-            # Dilate by some multiple of the expected span of each current interval,
-            # with some bias added in.
-            dilation = self.dilation_bias + self.dilation_multiplier * (
-                    init_s_far - init_s_near) / prod_num_samples
-
-            # Record the product of the number of samples seen so far.
-            prod_num_samples *= num_samples
-
-            # After the first level (where dilation would be a no-op) optionally
-            # dilate the interval weights along each ray slightly so that they're
-            # overestimates, which can reduce aliasing.
-            use_dilation = self.dilation_bias > 0 or self.dilation_multiplier > 0
-            if i_level > 0 and use_dilation:
-                sdist, weights = stepfun.max_dilate_weights(
-                    sdist,
-                    weights,
-                    dilation,
-                    domain=(init_s_near, init_s_far),
-                    renormalize=True)
-                sdist = sdist[..., 1:-1]
-                weights = weights[..., 1:-1]
-
-            # Optionally anneal the weights as a function of training iteration.
-            if self.anneal_slope > 0:
-                # Schlick's bias function, see https://arxiv.org/abs/2010.09714
-                bias = lambda x, s: (s * x) / ((s - 1) * x + 1)
-                anneal = bias(train_frac, self.anneal_slope)
-            else:
-                anneal = 1.
-
-            # A slightly more stable way to compute weights**anneal. If the distance
-            # between adjacent intervals is zero then its weight is fixed to 0.
-            logits_resample = torch.where(
-                sdist[..., 1:] > sdist[..., :-1],
-                anneal * torch.log(weights + self.resample_padding),
-                torch.full_like(sdist[..., :-1], -torch.inf))
-
-            # Draw sampled intervals from each ray's current weights.
-            if self.config.importance_sampling:
-                sdist = self.backend.funcs.sample_intervals(
-                    rand,
-                    sdist.contiguous(),
-                    stepfun.integrate_weights(torch.softmax(logits_resample, dim=-1)).contiguous(),
-                    num_samples,
-                    self.single_jitter)
-            else:
-                sdist = stepfun.sample_intervals(
-                    rand,
-                    sdist,
-                    logits_resample,
-                    num_samples,
-                    single_jitter=self.single_jitter,
-                    domain=(init_s_near, init_s_far))
-
-            # Optimization will usually go nonlinear if you propagate gradients
-            # through sampling.
-            if self.stop_level_grad:
-                sdist = sdist.detach()
-
-            # Convert normalized distances to metric distances.
-            tdist = s_to_t(sdist)
-
-            # Cast our rays, by turning our distance intervals into Gaussians.
-            means, stds, ts = render.cast_rays(
-                tdist,
-                batch['origins'],
-                batch['directions'],
-                batch['cam_dirs'],
-                batch['radii'],
-                rand,
-                std_scale=self.std_scale)
-
-            # Push our Gaussians through one of our two MLPs.
             mlp = (self.get_submodule(
                 f'prop_mlp_{i_level}') if self.distinct_prop else self.prop_mlp) if is_prop else self.nerf_mlp
+            
+            def occ_eval_fn(x):
+                stds = torch.from_numpy(np.zeros_like(x[..., 0].cpu())).cuda()
+                raw_density, _, _ = mlp.predict_density(x, stds, rand=rand)
+                density = trunc_exp(raw_density + mlp.density_bias)
+                # approximate for 1 - torch.exp(-density[...,None] * self.render_step_size) based on taylor series
+                self.render_step_size[i_level] = 1.732 * 2 * self.scene_radius / num_samples
+                return density[...,None] * self.render_step_size[i_level]
+
+            # TODO update only for training
+            self.occupancy_grid[i_level].every_n_step(step=self.global_occupancy_grid_update_step, occ_eval_fn=occ_eval_fn)
+
+            def sigma_fn(t_starts, t_ends, ray_indices):
+                ray_indices = ray_indices.long()
+                t_origins = batch['origins'][:, 0, 0][ray_indices] if len(batch['origins'].shape) == 4 else batch['origins'][ray_indices]
+                t_dirs = batch['directions'][:, 0, 0][ray_indices] if len(batch['directions'].shape) == 4 else batch['directions'][ray_indices]
+                positions = t_origins + t_dirs * (t_starts + t_ends) / 2.
+                stds = torch.from_numpy(np.zeros_like(positions[..., 0].cpu())).cuda()
+                raw_density, _, _ = mlp.predict_density(positions, stds, rand=rand)
+                density = trunc_exp(raw_density + mlp.density_bias)
+                return density[...,None]
+
+            with torch.no_grad():
+                ray_indices, t_starts, t_ends = ray_marching(
+                    batch['origins'][:, 0, 0] if len(batch['origins'].shape) == 4 else batch['origins'],
+                    batch['directions'][:, 0, 0] if len(batch['directions'].shape) == 4 else batch['directions'],
+                    scene_aabb=self.scene_aabb,
+                    grid=self.occupancy_grid[i_level],
+                    sigma_fn=sigma_fn,
+                    near_plane=None, far_plane=None,
+                    render_step_size=self.render_step_size[i_level],
+                    stratified=True,
+                    cone_angle=0.0,
+                    alpha_thre=0.0
+                )
+            ray_indices = ray_indices.long()
+            t_origins = batch['origins'][:, 0, 0][ray_indices] if len(batch['origins'].shape) == 4 else batch['origins'][ray_indices]
+            t_dirs = batch['directions'][:, 0, 0][ray_indices] if len(batch['directions'].shape) == 4 else batch['directions'][ray_indices]
+            midpoints = (t_starts + t_ends) / 2.
+            means = t_origins + t_dirs * midpoints
+            stds = torch.from_numpy(np.zeros_like(means[..., 0].cpu())).cuda()
+
             ray_results = mlp(
                 rand,
                 means, stds,
-                viewdirs=batch['viewdirs'] if self.use_viewdirs else None,
+                viewdirs=t_dirs if self.use_viewdirs else None,
                 imageplane=batch.get('imageplane'),
                 glo_vec=None if is_prop else glo_vec,
                 exposure=batch.get('exposure_values'),
             )
-            if self.config.gradient_scaling:
-                ray_results['rgb'], ray_results['density'] = train_utils.GradientScaler.apply(
-                    ray_results['rgb'], ray_results['density'], ts.mean(dim=-1))
 
-            # Get the weights used by volumetric rendering (and our other losses).
-            weights = render.compute_alpha_weights(
-                ray_results['density'],
-                tdist,
-                batch['directions'],
-                opaque_background=self.opaque_background,
-            )[0]
+            n_rays = batch['origins'].shape[0]
+            weights = render_weight_from_density(t_starts, t_ends, ray_results['density'][...,None], ray_indices=ray_indices, n_rays=n_rays)
 
             # Define or sample the background color for each ray.
             if self.bg_intensity_range[0] == self.bg_intensity_range[1]:
@@ -276,29 +251,14 @@ class Model(nn.Module):
                     ray_results['rgb'] *= scaling[..., None, :]
 
             # Render each ray.
-            rendering = render.volumetric_rendering(
-                ray_results['rgb'],
-                weights,
-                tdist,
-                bg_rgbs,
-                batch['far'],
-                compute_extras,
-                extras={
-                    k: v
-                    for k, v in ray_results.items()
-                    if k.startswith('normals') or k in ['roughness']
-                })
-
-            if compute_extras:
-                # Collect some rays to visualize directly. By naming these quantities
-                # with `ray_` they get treated differently downstream --- they're
-                # treated as bags of rays, rather than image chunks.
-                n = self.config.vis_num_rays
-                rendering['ray_sdist'] = sdist.reshape([-1, sdist.shape[-1]])[:n, :]
-                rendering['ray_weights'] = (
-                    weights.reshape([-1, weights.shape[-1]])[:n, :])
-                rgb = ray_results['rgb']
-                rendering['ray_rgbs'] = (rgb.reshape((-1,) + rgb.shape[-2:]))[:n, :, :]
+            rendering = render.volumetric_rendering_acc(
+                rgb=ray_results['rgb'],
+                weights=weights,
+                ray_indices=ray_indices,
+                midpoints=midpoints,
+                n_rays=n_rays,
+                background_color=torch.from_numpy(np.full((3,), bg_rgbs, dtype=np.float32)).cuda()
+            )
 
             # TODO: return hash decay loss
             # if self.training:
@@ -316,10 +276,11 @@ class Model(nn.Module):
             #         ray_results['loss_hash_decay'] = loss_hash_decay
 
             renderings.append(rendering)
-            ray_results['sdist'] = sdist.clone()
             ray_results['weights'] = weights.clone()
             ray_history.append(ray_results)
 
+        self.global_occupancy_grid_update_step +=1
+        
         if compute_extras:
             # Because the proposal network doesn't produce meaningful colors, for
             # easier visualization we replace their colors with the final average
@@ -566,31 +527,31 @@ class MLP(nn.Module):
         if not self.use_fully_fused_mlp:
             features = self.encoder(means, bound=1).unflatten(-1, (self.encoder.num_levels, -1))
             weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.encoder.grid_sizes ** 2))
+            features = (features * weights[..., None]).mean(dim=-3).flatten(-2, -1)
+            if self.scale_featurization:
+                with torch.no_grad():
+                    vl2mean = segment_coo((self.encoder.embeddings ** 2).sum(-1),
+                                        self.encoder.idx,
+                                        torch.zeros(self.grid_num_levels, device=weights.device),
+                                        self.grid_num_levels,
+                                        reduce='mean'
+                                        )
+                featurized_w = (2 * weights.mean(dim=-2) - 1) * (self.encoder.init_std ** 2 + vl2mean).sqrt()
+                features = torch.cat([features, featurized_w], dim=-1)
+            x = self.density_layer(features)
+            raw_density = x[..., 0]  # Hardcoded to a single channel.
+            # Add noise to regularize the density predictions if needed.
+            if rand and (self.density_noise > 0):
+                raw_density += self.density_noise * torch.randn_like(raw_density)
+            return raw_density, x, means.mean(dim=-2)
         else:
             features = self.encoder(means.view(-1, self.feature_encoding_n_input)).view(*means.shape[:-1], self.density_layer_n_input_dims).float()
-            features = features.unflatten(-1, (self.xyz_encoding_params.num_levels, -1))
-            # weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.xyz_encoding_params.grid_sizes ** 2))
-            weights = torch.from_numpy(np.ones_like(features[..., 0].detach().cpu())).to(features.device)
-        features = (features * weights[..., None]).mean(dim=-3).flatten(-2, -1)
-        if self.scale_featurization and not self.use_fully_fused_mlp:
-            with torch.no_grad():
-                vl2mean = segment_coo((self.encoder.embeddings ** 2).sum(-1),
-                                      self.encoder.idx,
-                                      torch.zeros(self.grid_num_levels, device=weights.device),
-                                      self.grid_num_levels,
-                                      reduce='mean'
-                                      )
-            featurized_w = (2 * weights.mean(dim=-2) - 1) * (self.encoder.init_std ** 2 + vl2mean).sqrt()
-            features = torch.cat([features, featurized_w], dim=-1)
-        if self.use_fully_fused_mlp:
             x = self.density_layer(features.view(-1, self.density_layer_n_input_dims)).view(*features.shape[:-1], self.density_layer_n_output_dims).float()
-        else:
-            x = self.density_layer(features)
-        raw_density = x[..., 0]  # Hardcoded to a single channel.
-        # Add noise to regularize the density predictions if needed.
-        if rand and (self.density_noise > 0):
-            raw_density += self.density_noise * torch.randn_like(raw_density)
-        return raw_density, x, means.mean(dim=-2)
+            raw_density = x[..., 0]  # Hardcoded to a single channel.
+            # Add noise to regularize the density predictions if needed.
+            if rand and (self.density_noise > 0):
+                raw_density += self.density_noise * torch.randn_like(raw_density)
+            return raw_density, x, means.mean(dim=-2)
 
     def forward(self,
                 rand,
@@ -703,6 +664,7 @@ class MLP(nn.Module):
                     x = []
 
                 # Encode view (or reflection) directions.
+                dir_enc = None
                 if self.use_reflections:
                     # Compute reflection directions. Note that we flip viewdirs before
                     # reflecting, because they point from the camera to the point,
@@ -719,29 +681,22 @@ class MLP(nn.Module):
                             dir_enc[..., None, :],
                             bottleneck.shape[:-1] + (dir_enc.shape[-1],))
                     else:
-                        if len(viewdirs.shape) == 4:
-                            viewdirs_scaled = (viewdirs[:, 0, 0] + 1.) / 2.
-                            dir_enc = self.dir_enc_fn(viewdirs_scaled.view(-1, 3)).unsqueeze(1).unsqueeze(2)
-                        else:
-                            viewdirs_scaled = (viewdirs + 1.) / 2.
-                            dir_enc = self.dir_enc_fn(viewdirs_scaled.view(-1, 3))
-                        dir_enc = torch.broadcast_to(
-                            dir_enc[..., None, :],
-                            bottleneck.shape[:-1] + (dir_enc.shape[-1],))
+                        viewdirs_scaled = (viewdirs + 1.) / 2.
+                        dir_enc = self.dir_enc_fn(viewdirs_scaled.view(-1, 3))
 
-                # Append view (or reflection) direction encoding to bottleneck vector.
-                x.append(dir_enc)
+                if not self.use_fully_fused_mlp:    
+                    # Append view (or reflection) direction encoding to bottleneck vector.
+                    x.append(dir_enc)
 
-                # Append dot product between normal vectors and view directions.
-                if self.use_n_dot_v:
-                    dotprod = torch.sum(
-                        normals_to_use * viewdirs[..., None, :], dim=-1, keepdim=True)
-                    x.append(dotprod)
+                    # Append dot product between normal vectors and view directions.
+                    if self.use_n_dot_v:
+                        dotprod = torch.sum(
+                            normals_to_use * viewdirs[..., None, :], dim=-1, keepdim=True)
+                        x.append(dotprod)
 
-                # Concatenate bottleneck, directional encoding, and GLO.
-                x = torch.cat(x, dim=-1)
-                # Output of the second part of MLP.
-                if not self.use_fully_fused_mlp:
+                    # Concatenate bottleneck, directional encoding, and GLO.
+                    x = torch.cat(x, dim=-1)
+
                     inputs = x
                     for i in range(self.net_depth_viewdirs):
                         x = self.get_submodule(f"lin_second_stage_{i}")(x)
@@ -751,8 +706,9 @@ class MLP(nn.Module):
             # If using diffuse/specular colors, then `rgb` is treated as linear
             # specular color. Otherwise it's treated as the color itself.
             if self.use_fully_fused_mlp:
+                network_inp = torch.cat([bottleneck.view(-1, bottleneck.shape[-1]), dir_enc], dim=-1)
                 rgb = torch.sigmoid(self.rgb_premultiplier *
-                                    self.rgb_layer(x.view(-1, self.rgb_layer_n_input_dims)).view(*x.shape[:-1], self.rgb_layer_n_output_dims).float() +
+                                    self.rgb_layer(network_inp).view(*bottleneck.shape[:-1], self.rgb_layer_n_output_dims).float() +
                                     self.rgb_bias)
             else:
                 rgb = torch.sigmoid(self.rgb_premultiplier *
@@ -831,7 +787,7 @@ def render_image(model,
         chunk_renderings, ray_history = model(rand,
                                               chunk_batch,
                                               train_frac=train_frac,
-                                              compute_extras=True,
+                                              compute_extras=False,
                                               zero_glo=True)
 
         # Gather the final pass for 2D buffers and all passes for ray bundles.

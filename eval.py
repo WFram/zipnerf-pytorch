@@ -158,31 +158,32 @@ def main(unused_argv):
                     rgb_cc = crop_fn(rgb_cc)
                     rgb_gt = crop_fn(rgb_gt)
 
-                metric = metric_harness(rgb, rgb_gt)
-                metric_cc = metric_harness(rgb_cc, rgb_gt)
+                # TODO: return it
+                # metric = metric_harness(rgb, rgb_gt)
+                # metric_cc = metric_harness(rgb_cc, rgb_gt)
 
-                if config.compute_disp_metrics:
-                    for tag in ['mean', 'median']:
-                        key = f'distance_{tag}'
-                        if key in rendering:
-                            disparity = 1 / (1 + rendering[key])
-                            metric[f'disparity_{tag}_mse'] = float(
-                                ((disparity - batch['disps']) ** 2).mean())
+                # if config.compute_disp_metrics:
+                #     for tag in ['mean', 'median']:
+                #         key = f'distance_{tag}'
+                #         if key in rendering:
+                #             disparity = 1 / (1 + rendering[key])
+                #             metric[f'disparity_{tag}_mse'] = float(
+                #                 ((disparity - batch['disps']) ** 2).mean())
 
-                if config.compute_normal_metrics:
-                    weights = rendering['acc'] * batch['alphas']
-                    normalized_normals_gt = ref_utils.l2_normalize_np(batch['normals'])
-                    for key, val in rendering.items():
-                        if key.startswith('normals') and val is not None:
-                            normalized_normals = ref_utils.l2_normalize_np(val)
-                            metric[key + '_mae'] = ref_utils.compute_weighted_mae_np(
-                                weights, normalized_normals, normalized_normals_gt)
+                # if config.compute_normal_metrics:
+                #     weights = rendering['acc'] * batch['alphas']
+                #     normalized_normals_gt = ref_utils.l2_normalize_np(batch['normals'])
+                #     for key, val in rendering.items():
+                #         if key.startswith('normals') and val is not None:
+                #             normalized_normals = ref_utils.l2_normalize_np(val)
+                #             metric[key + '_mae'] = ref_utils.compute_weighted_mae_np(
+                #                 weights, normalized_normals, normalized_normals_gt)
 
-                for m, v in metric.items():
-                    logging.info(f'{m:30s} = {v:.4f}')
+                # for m, v in metric.items():
+                #     logging.info(f'{m:30s} = {v:.4f}')
 
-                metrics.append(metric)
-                metrics_cc.append(metric_cc)
+                # metrics.append(metric)
+                # metrics_cc.append(metric_cc)
 
             if config.eval_save_output and (config.eval_render_interval > 0):
                 if (idx % config.eval_render_interval) == 0:
@@ -191,17 +192,18 @@ def main(unused_argv):
                     utils.save_img_u8(postprocess_fn(rendering['rgb_cc']),
                                       path_fn(f'color_cc_{idx:03d}.png'))
 
-                    for key in ['distance_mean', 'distance_median']:
-                        if key in rendering:
-                            utils.save_img_f32(rendering[key],
-                                               path_fn(f'{key}_{idx:03d}.tiff'))
+                    # TODO: return it
+                    # for key in ['distance_mean', 'distance_median']:
+                    #     if key in rendering:
+                    #         utils.save_img_f32(rendering[key],
+                    #                            path_fn(f'{key}_{idx:03d}.tiff'))
 
-                    for key in ['normals']:
-                        if key in rendering:
-                            utils.save_img_u8(rendering[key] / 2. + 0.5,
-                                              path_fn(f'{key}_{idx:03d}.png'))
+                    # for key in ['normals']:
+                    #     if key in rendering:
+                    #         utils.save_img_u8(rendering[key] / 2. + 0.5,
+                    #                           path_fn(f'{key}_{idx:03d}.png'))
 
-                    utils.save_img_f32(rendering['acc'], path_fn(f'acc_{idx:03d}.tiff'))
+                    # utils.save_img_f32(rendering['acc'], path_fn(f'acc_{idx:03d}.tiff'))
 
         if (not config.eval_only_once):
             summary_writer.add_scalar('eval_median_render_time', np.median(render_times),

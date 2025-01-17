@@ -109,6 +109,8 @@ def load_exif(pth):
 
 def save_img_u8(img, pth):
     """Save an image (probably RGB) in [0, 1] to disk as a uint8 PNG."""
+    # FIXME
+    if len(img.shape) == 5: img = img[:, :, 0, 0]
     Image.fromarray(
         (np.clip(np.nan_to_num(img), 0., 1.) * 255.).astype(np.uint8)).save(
         pth, 'PNG')

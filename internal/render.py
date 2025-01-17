@@ -5,6 +5,7 @@ from internal import math
 from internal import utils
 import torch
 import torch.nn.functional as F
+from nerfacc import accumulate_along_rays
 
 
 def lift_gaussian(d, t_mean, t_var, r_var, diag):
@@ -269,5 +270,33 @@ def volumetric_rendering(rgbs,
         for i, p in enumerate(ps):
             s = 'median' if p == 50 else 'percentile_' + str(p)
             rendering['distance_' + s] = distance_percentiles[..., i]
+
+    return rendering
+
+def volumetric_rendering_acc(rgb,
+                             weights,
+                             ray_indices,    
+                             midpoints,
+                             n_rays,
+                             background_color):
+    """Volumetric Rendering Function with NeRF acceleration.
+
+  Args:
+    ...
+
+  Returns:
+    rendering: a dict containing an rgb image of size [batch_size, 3], and other
+      visualizations if compute_extras=True.
+  """
+    rendering = {}
+
+    opacity = accumulate_along_rays(weights, ray_indices, values=None, n_rays=n_rays)
+    depth = accumulate_along_rays(weights, ray_indices, values=midpoints, n_rays=n_rays)
+    comp_rgb = accumulate_along_rays(weights, ray_indices, values=rgb, n_rays=n_rays)
+    comp_rgb = comp_rgb + background_color * (1.0 - opacity)
+
+    rendering['rgb'] = comp_rgb.unsqueeze(1).unsqueeze(2)
+    rendering['depth'] = depth
+    rendering['acc'] = opacity
 
     return rendering
