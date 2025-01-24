@@ -5,6 +5,18 @@ import torch
 # from torch.func import vmap, jacrev
 
 
+def scale_anything(dat, std, inp_scale, tgt_scale):
+    if inp_scale is None:
+        inp_scale = [dat.min(), dat.max()]
+    normalize = lambda x: (x  - inp_scale[0]) / (inp_scale[1] - inp_scale[0])
+    scale = lambda x: x * (tgt_scale[1] - tgt_scale[0]) + tgt_scale[0]
+    return scale(normalize(dat)), scale(normalize(std))
+
+
+def contract_to_unisphere(x, std, radius):
+    return scale_anything(x, std, (-radius, radius), (0, 1))
+
+
 def contract(x):
     """Contracts points towards the origin (Eq 10 of arxiv.org/abs/2111.12077)."""
     eps = torch.finfo(x.dtype).eps

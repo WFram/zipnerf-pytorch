@@ -184,6 +184,63 @@ def cast_rays(tdist, origins, directions, cam_dirs, radii, rand=True, n=7, m=3, 
     return means, stds, t
 
 
+def cast_rays_acc(t0, t1, origins, directions, radii, rand=True, std_scale=0.5):
+    """The version of `cast_rays`, which assumes t0 and t1 known.
+
+  Args:
+    t0: float array, the "fencepost" start points along the array.
+    t1: float array, the "fencepost" end points along the array.
+    origins: float array, the ray origin coordinates.
+    directions: float array, the ray direction vectors.
+    radii: float array, the radii (base radii for cones) of the rays.
+
+  Returns:
+    a tuple of arrays of means and covariances.
+  """
+    means = None
+    stds = None
+
+    t_m = ((t0 + t1) / 2)[..., None]
+    t_d = ((t1 - t0) / 2)[..., None]
+
+    j = torch.arange(6, device=t0.device)
+    t = t0[..., None] + t_d / (t_d ** 2 + 3 * t_m ** 2) * (t1[..., None] ** 2 + 2 * t_m ** 2 + 3 / 7 ** 0.5 * (2 * j / 5 - 1) * (
+        (t_d ** 2 - t_m ** 2) ** 2 + 4 * t_m ** 4).sqrt())
+
+    deg = torch.pi / 3 * torch.tensor([0, 2, 4, 3, 5, 1], device=t0.device, dtype=torch.float)
+    deg = torch.broadcast_to(deg, t.shape)
+    if rand:
+        # randomly rotate and flip
+        mask = torch.rand_like(t0) > 0.5
+        deg = deg + 2 * torch.pi * torch.rand_like(deg[..., 0])[..., None]
+        deg = torch.where(mask[..., None], deg, torch.pi * 5 / 3 - deg)
+    else:
+        # rotate 30 degree and flip every other pattern
+        mask = torch.arange(t.shape[-2], device=t0.device) % 2 == 0
+        mask = torch.broadcast_to(mask, t.shape[:-1])
+        deg = torch.where(mask[..., None], deg, deg + torch.pi / 6)
+        deg = torch.where(mask[..., None], deg, torch.pi * 5 / 3 - deg)
+    means = torch.stack([
+        radii * t * torch.cos(deg) / 2 ** 0.5,
+        radii * t * torch.sin(deg) / 2 ** 0.5,
+        t
+    ], dim=-1)
+    stds = std_scale * radii * t / 2 ** 0.5
+
+    # two basis in parallel to the image plane
+    rand_vec = torch.randn_like(directions)
+    ortho1 = F.normalize(torch.cross(directions, rand_vec, dim=-1), dim=-1)
+    ortho2 = F.normalize(torch.cross(directions, ortho1, dim=-1), dim=-1)
+
+    # just use directions to be the third vector of the orthonormal basis,
+    # while the cross section of cone is parallel to the image plane
+    basis_matrix = torch.stack([ortho1, ortho2, directions], dim=-1)
+    means = math.matmul(means, basis_matrix.transpose(-1, -2))
+    means = means + torch.broadcast_to(origins[..., None, :], means.shape)
+
+    return means, stds
+
+
 def compute_alpha_weights(density, tdist, dirs, opaque_background=False):
     """Helper function for computing alpha compositing weights."""
     t_delta = tdist[..., 1:] - tdist[..., :-1]
@@ -290,9 +347,9 @@ def volumetric_rendering_acc(rgb,
   """
     rendering = {}
 
-    opacity = accumulate_along_rays(weights, ray_indices, values=None, n_rays=n_rays)
-    depth = accumulate_along_rays(weights, ray_indices, values=midpoints, n_rays=n_rays)
-    comp_rgb = accumulate_along_rays(weights, ray_indices, values=rgb, n_rays=n_rays)
+    opacity = accumulate_along_rays(weights, ray_indices=ray_indices, values=None, n_rays=n_rays)
+    depth = accumulate_along_rays(weights, ray_indices=ray_indices, values=midpoints, n_rays=n_rays)
+    comp_rgb = accumulate_along_rays(weights, ray_indices=ray_indices, values=rgb, n_rays=n_rays)
     comp_rgb = comp_rgb + background_color * (1.0 - opacity)
 
     rendering['rgb'] = comp_rgb.unsqueeze(1).unsqueeze(2)

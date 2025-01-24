@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import tinycudann as tcnn
-from nerfacc import ContractionType, OccupancyGrid, ray_marching, render_weight_from_density
+from nerfacc import OccGridEstimator, render_weight_from_density
 from omegaconf import OmegaConf
 from torch.utils._pytree import tree_map
 from tqdm import tqdm
@@ -119,11 +119,10 @@ class Model(nn.Module):
         self.scene_radius = 5
         self.scene_aabb = torch.as_tensor([-self.scene_radius, -self.scene_radius, -self.scene_radius, self.scene_radius, self.scene_radius, self.scene_radius], dtype=torch.float32).cuda()
         occupancy_grid_res = [128, 128, 128]
-        contraction_type = ContractionType.AABB
-        self.occupancy_grid = [OccupancyGrid(
+        self.occupancy_grid_estimator = [OccGridEstimator(
             roi_aabb=self.scene_aabb,
             resolution=occupancy_grid_res[i_level],
-            contraction_type=contraction_type
+            levels=1
         ).cuda() for i_level in range(self.num_levels)]
         self.global_occupancy_grid_update_step = 0
         self.render_step_size = [1.732 * 2 * self.scene_radius / self.num_prop_samples,
@@ -173,33 +172,36 @@ class Model(nn.Module):
             
             def occ_eval_fn(x):
                 stds = torch.from_numpy(np.zeros_like(x[..., 0].cpu())).cuda()
-                raw_density, _, _ = mlp.predict_density(x, stds, rand=rand)
-                density = trunc_exp(raw_density + mlp.density_bias)
+                raw_density, _, _ = mlp.predict_density(x, stds, self.scene_radius, rand=rand)
+                if mlp.use_fully_fused_mlp:
+                    density = trunc_exp(raw_density + mlp.density_bias)
+                else:
+                    density = F.softplus(raw_density + mlp.density_bias)
                 # approximate for 1 - torch.exp(-density[...,None] * self.render_step_size) based on taylor series
                 self.render_step_size[i_level] = 1.732 * 2 * self.scene_radius / num_samples
                 return density[...,None] * self.render_step_size[i_level]
 
             # TODO update only for training
-            self.occupancy_grid[i_level].every_n_step(step=self.global_occupancy_grid_update_step, occ_eval_fn=occ_eval_fn)
+            self.occupancy_grid_estimator[i_level].update_every_n_steps(step=self.global_occupancy_grid_update_step, occ_eval_fn=occ_eval_fn)
 
             def sigma_fn(t_starts, t_ends, ray_indices):
                 ray_indices = ray_indices.long()
                 t_origins = batch['origins'][:, 0, 0][ray_indices] if len(batch['origins'].shape) == 4 else batch['origins'][ray_indices]
                 t_dirs = batch['directions'][:, 0, 0][ray_indices] if len(batch['directions'].shape) == 4 else batch['directions'][ray_indices]
-                positions = t_origins + t_dirs * (t_starts + t_ends) / 2.
+                positions = t_origins + t_dirs * (t_starts[..., None] + t_ends[..., None]) / 2.
                 stds = torch.from_numpy(np.zeros_like(positions[..., 0].cpu())).cuda()
-                raw_density, _, _ = mlp.predict_density(positions, stds, rand=rand)
-                density = trunc_exp(raw_density + mlp.density_bias)
-                return density[...,None]
+                raw_density, _, _ = mlp.predict_density(positions, stds, self.scene_radius, rand=rand)
+                if mlp.use_fully_fused_mlp:
+                    density = trunc_exp(raw_density + mlp.density_bias)
+                else:
+                    density = F.softplus(raw_density + mlp.density_bias)
+                return density
 
             with torch.no_grad():
-                ray_indices, t_starts, t_ends = ray_marching(
+                ray_indices, t_starts, t_ends = self.occupancy_grid_estimator[i_level].sampling(
                     batch['origins'][:, 0, 0] if len(batch['origins'].shape) == 4 else batch['origins'],
                     batch['directions'][:, 0, 0] if len(batch['directions'].shape) == 4 else batch['directions'],
-                    scene_aabb=self.scene_aabb,
-                    grid=self.occupancy_grid[i_level],
                     sigma_fn=sigma_fn,
-                    near_plane=None, far_plane=None,
                     render_step_size=self.render_step_size[i_level],
                     stratified=True,
                     cone_angle=0.0,
@@ -208,13 +210,16 @@ class Model(nn.Module):
             ray_indices = ray_indices.long()
             t_origins = batch['origins'][:, 0, 0][ray_indices] if len(batch['origins'].shape) == 4 else batch['origins'][ray_indices]
             t_dirs = batch['directions'][:, 0, 0][ray_indices] if len(batch['directions'].shape) == 4 else batch['directions'][ray_indices]
-            midpoints = (t_starts + t_ends) / 2.
-            means = t_origins + t_dirs * midpoints
-            stds = torch.from_numpy(np.zeros_like(means[..., 0].cpu())).cuda()
+            means, stds = render.cast_rays_acc(t_starts, t_ends,
+                                               t_origins, t_dirs, 
+                                               batch['radii'][:, 0, 0][ray_indices] if len(batch['radii'].shape) == 4 else batch['radii'][ray_indices],
+                                               rand, std_scale=self.std_scale)
+            midpoints = (t_starts + t_ends)[..., None] / 2.0
 
             ray_results = mlp(
                 rand,
                 means, stds,
+                self.scene_radius,
                 viewdirs=t_dirs if self.use_viewdirs else None,
                 imageplane=batch.get('imageplane'),
                 glo_vec=None if is_prop else glo_vec,
@@ -222,7 +227,7 @@ class Model(nn.Module):
             )
 
             n_rays = batch['origins'].shape[0]
-            weights = render_weight_from_density(t_starts, t_ends, ray_results['density'][...,None], ray_indices=ray_indices, n_rays=n_rays)
+            weights, _, _ = render_weight_from_density(t_starts, t_ends, ray_results['density'], ray_indices=ray_indices, n_rays=n_rays)
 
             # Define or sample the background color for each ray.
             if self.bg_intensity_range[0] == self.bg_intensity_range[1]:
@@ -482,19 +487,16 @@ class MLP(nn.Module):
                                                          feature_encoding_config.get('per_level_scale'))
             
             # self.xyz_encoding_params.num_levels = int(
-                # np.log(self.grid_disired_resolution / self.xyz_encoding_params.base_resolution) / np.log(self.grid_level_interval)) + 1
+            #     np.log(self.grid_disired_resolution / self.xyz_encoding_params.base_resolution) / np.log(self.grid_level_interval)) + 1
             # feature_encoding_config['n_levels'] = self.xyz_encoding_params.num_levels
-            # density_mlp_config = density_config.get('mlp_network_config')
-            # assert self.bottleneck_width > 0
-            # last_dim = self.xyz_encoding_params.num_levels * self.xyz_encoding_params.level_dim
-            # resolutions = [int(np.ceil(self.xyz_encoding_params.base_resolution * self.xyz_encoding_params.per_level_scale ** i)) + 1 \
-                        #    for i in range(self.xyz_encoding_params.num_levels)]
-            # self.xyz_encoding_params.grid_sizes = torch.from_numpy(np.array(resolutions, dtype=np.int32)).cuda()
-            
+
             self.xyz_encoding_params.num_levels = feature_encoding_config['n_levels']
             density_mlp_config = density_config.get('mlp_network_config')
             assert self.bottleneck_width > 0
             last_dim = self.xyz_encoding_params.num_levels * self.xyz_encoding_params.level_dim
+            resolutions = [int(np.ceil(self.xyz_encoding_params.base_resolution * self.xyz_encoding_params.per_level_scale ** (i // self.xyz_encoding_params.level_dim))) + 1 \
+                           for i in range(self.xyz_encoding_params.num_levels * self.xyz_encoding_params.level_dim)]
+            self.xyz_encoding_params.grid_sizes = torch.from_numpy(np.array(resolutions, dtype=np.int32)).cuda()
             
             with torch.cuda.device(get_rank()):
                 self.feature_encoding_n_input = 3
@@ -515,16 +517,21 @@ class MLP(nn.Module):
                     self.rgb_layer_n_output_dims = self.num_rgb_channels
                     self.rgb_layer = tcnn.Network(self.rgb_layer_n_input_dims, self.rgb_layer_n_output_dims, omega_config_to_primitive(rgb_mlp_config))
 
-    def predict_density(self, means, stds, rand=False, no_warp=False):
+    def predict_density(self, means, stds, scene_radius, rand=False, no_warp=False):
         """Helper function to output density."""
         # Encode input positions
-        if self.warp_fn is not None and not no_warp:
+        if not self.use_fully_fused_mlp and self.warp_fn is not None and not no_warp:
             means, stds = coord.track_linearize(self.warp_fn, means, stds)
             # contract [-2, 2] to [-1, 1]
             bound = 2
             means = means / bound
             stds = stds / bound
+        else:
+            means, stds = coord.contract_to_unisphere(means, stds, scene_radius)
         if not self.use_fully_fused_mlp:
+            if len(means.shape) == 2:
+                means = means[:, None]
+                stds = stds[:, None]
             features = self.encoder(means, bound=1).unflatten(-1, (self.encoder.num_levels, -1))
             weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.encoder.grid_sizes ** 2))
             features = (features * weights[..., None]).mean(dim=-3).flatten(-2, -1)
@@ -546,6 +553,10 @@ class MLP(nn.Module):
             return raw_density, x, means.mean(dim=-2)
         else:
             features = self.encoder(means.view(-1, self.feature_encoding_n_input)).view(*means.shape[:-1], self.density_layer_n_input_dims).float()
+            if len(features.shape) > 2:
+                # weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.xyz_encoding_params.grid_sizes ** 2))
+                weights = torch.ones_like(features)
+                features = (features * weights).mean(dim=-2)
             x = self.density_layer(features.view(-1, self.density_layer_n_input_dims)).view(*features.shape[:-1], self.density_layer_n_output_dims).float()
             raw_density = x[..., 0]  # Hardcoded to a single channel.
             # Add noise to regularize the density predictions if needed.
@@ -556,6 +567,7 @@ class MLP(nn.Module):
     def forward(self,
                 rand,
                 means, stds,
+                scene_radius,
                 viewdirs=None,
                 imageplane=None,
                 glo_vec=None,
@@ -586,13 +598,13 @@ class MLP(nn.Module):
       roughness: [..., 1], or None.
     """
         if self.disable_density_normals:
-            raw_density, x, means_contract = self.predict_density(means, stds, rand=rand, no_warp=no_warp)
+            raw_density, x, means_contract = self.predict_density(means, stds, scene_radius, rand=rand, no_warp=no_warp)
             raw_grad_density = None
             normals = None
         else:
             with torch.enable_grad():
                 means.requires_grad_(True)
-                raw_density, x, means_contract = self.predict_density(means, stds, rand=rand, no_warp=no_warp)
+                raw_density, x, means_contract = self.predict_density(means, stds, scene_radius, rand=rand, no_warp=no_warp)
                 d_output = torch.ones_like(raw_density, requires_grad=False, device=raw_density.device)
                 raw_grad_density = torch.autograd.grad(
                     outputs=raw_density,
@@ -677,26 +689,16 @@ class MLP(nn.Module):
                     # Encode view directions.
                     if not self.use_fully_fused_mlp:
                         dir_enc = self.dir_enc_fn(viewdirs, roughness)
-                        dir_enc = torch.broadcast_to(
-                            dir_enc[..., None, :],
-                            bottleneck.shape[:-1] + (dir_enc.shape[-1],))
                     else:
                         viewdirs_scaled = (viewdirs + 1.) / 2.
                         dir_enc = self.dir_enc_fn(viewdirs_scaled.view(-1, 3))
 
                 if not self.use_fully_fused_mlp:    
-                    # Append view (or reflection) direction encoding to bottleneck vector.
-                    x.append(dir_enc)
 
-                    # Append dot product between normal vectors and view directions.
-                    if self.use_n_dot_v:
-                        dotprod = torch.sum(
-                            normals_to_use * viewdirs[..., None, :], dim=-1, keepdim=True)
-                        x.append(dotprod)
 
-                    # Concatenate bottleneck, directional encoding, and GLO.
-                    x = torch.cat(x, dim=-1)
 
+
+                    x = torch.cat([bottleneck.view(-1, bottleneck.shape[-1]), dir_enc], dim=-1)
                     inputs = x
                     for i in range(self.net_depth_viewdirs):
                         x = self.get_submodule(f"lin_second_stage_{i}")(x)
