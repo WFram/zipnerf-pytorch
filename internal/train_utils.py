@@ -13,6 +13,7 @@ from internal import stepfun
 from internal import utils
 import numpy as np
 from torch.utils._pytree import tree_map, tree_flatten
+from torch_efficient_distloss import flatten_eff_distloss
 # from torch_scatter import segment_coo
 
 
@@ -173,6 +174,17 @@ def distortion_loss(ray_history, config):
     c = last_ray_results['sdist']
     w = last_ray_results['weights']
     loss = stepfun.lossfun_distortion(c, w).mean()
+    return config.distortion_loss_mult * loss
+
+
+def distortion_loss_acc(ray_history, config):
+    """Computes the efficient distortion loss regularizer defined in mip-NeRF 360."""
+    last_ray_results = ray_history[-1]
+    weights = last_ray_results['weights']
+    midpoints = last_ray_results['midpoints'][..., 0]
+    intervals = last_ray_results['intervals'][..., 0]
+    ray_indices = last_ray_results['ray_indices']
+    loss = flatten_eff_distloss(weights, midpoints, intervals, ray_indices)
     return config.distortion_loss_mult * loss
 
 

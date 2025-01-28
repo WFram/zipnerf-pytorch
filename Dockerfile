@@ -85,6 +85,6 @@ RUN bash -c "source activate zipnerf && \
 
 RUN bash -c "source activate zipnerf && \
     pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch && \
-    pip install omegaconf==2.2.3"
+    pip install omegaconf==2.2.3 nerfacc==0.5.3 torch_efficient_distloss"
 
 COPY . .

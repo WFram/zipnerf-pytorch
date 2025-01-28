@@ -215,6 +215,7 @@ class Model(nn.Module):
                                                batch['radii'][:, 0, 0][ray_indices] if len(batch['radii'].shape) == 4 else batch['radii'][ray_indices],
                                                rand, std_scale=self.std_scale)
             midpoints = (t_starts + t_ends)[..., None] / 2.0
+            intervals = (t_ends - t_starts)[..., None]
 
             ray_results = mlp(
                 rand,
@@ -282,6 +283,9 @@ class Model(nn.Module):
 
             renderings.append(rendering)
             ray_results['weights'] = weights.clone()
+            ray_results['midpoints'] = midpoints.clone()
+            ray_results['intervals'] = intervals.clone()
+            ray_results['ray_indices'] = ray_indices.clone()
             ray_history.append(ray_results)
 
         self.global_occupancy_grid_update_step +=1

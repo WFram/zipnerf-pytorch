@@ -14,7 +14,7 @@ Config.lr_init = 0.005
 Config.lr_final = 0.0005
 
 Config.anti_interlevel_loss_mult = 0
-Config.distortion_loss_mult = 0
+Config.distortion_loss_mult = 0.005
 
 Model.raydist_fn = None
 Model.num_levels = 1

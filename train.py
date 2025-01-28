@@ -167,7 +167,7 @@ def main(unused_argv):
 
             # distortion loss
             if config.distortion_loss_mult > 0:
-                losses['distortion'] = train_utils.distortion_loss(ray_history, config)
+                losses['distortion'] = train_utils.distortion_loss_acc(ray_history, config)
 
             # opacity loss
             if config.opacity_loss_mult > 0:
