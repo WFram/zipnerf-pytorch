@@ -471,12 +471,7 @@ def pixels_to_rays(pix_x_int, pix_y_int, pixtocams,
   Returns:
     origins: float array, shape SH + [3], ray origin points.
     directions: float array, shape SH + [3], ray direction vectors.
-    viewdirs: float array, shape SH + [3], normalized ray direction vectors.
     radii: float array, shape SH + [1], ray differential radii.
-    imageplane: float array, shape SH + [2], xy coordinates on the image plane.
-      If the image plane is at world space distance 1 from the pinhole, then
-      imageplane will be the xy coordinates of a pixel in that space (so the
-      camera ray direction at the origin would be (x, y, -1) in OpenGL coords).
   """
 
     # Must add half pixel offset to shoot rays through pixel centers.
@@ -519,9 +514,6 @@ def pixels_to_rays(pix_x_int, pix_y_int, pixtocams,
     camera_dirs_stacked = matmul(camera_dirs_stacked,
                                  np.diag(np.array([1., -1., -1.])))
 
-    # Extract 2D image plane (x, y) coordinates.
-    imageplane = camera_dirs_stacked[0, ..., :2]
-
     # Apply camera rotation matrices.
     directions_stacked = mat_vec_mul(camtoworlds[..., :3, :3],
                                      camera_dirs_stacked)
@@ -529,7 +521,6 @@ def pixels_to_rays(pix_x_int, pix_y_int, pixtocams,
     directions, dx, dy = directions_stacked
 
     origins = np.broadcast_to(camtoworlds[..., :3, -1], directions.shape)
-    viewdirs = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
 
     if pixtocam_ndc is None:
         # Distance from each unit-norm direction vector to its neighbors.
@@ -549,7 +540,7 @@ def pixels_to_rays(pix_x_int, pix_y_int, pixtocams,
     # Cut the distance in half, multiply it to match the variance of a uniform
     # distribution the size of a pixel (1/12, see the original mipnerf paper).
     radii = (0.5 * (dx_norm + dy_norm))[..., None] * 2 / np.sqrt(12)
-    return origins, directions, viewdirs, radii, imageplane
+    return origins, directions, radii
 
 
 def cast_ray_batch(cameras, pixels, camtype):
@@ -578,7 +569,7 @@ def cast_ray_batch(cameras, pixels, camtype):
     batch_index = lambda arr: arr if arr.ndim == 2 else arr[cam_idx]
 
     # Compute rays from pixel coordinates.
-    origins, directions, viewdirs, radii, imageplane = pixels_to_rays(
+    origins, directions, radii = pixels_to_rays(
         pixels['pix_x_int'],
         pixels['pix_y_int'],
         batch_index(pixtocams),
@@ -591,9 +582,7 @@ def cast_ray_batch(cameras, pixels, camtype):
     return dict(
         origins=origins,
         directions=directions,
-        viewdirs=viewdirs,
         radii=radii,
-        imageplane=imageplane,
         lossmult=pixels.get('lossmult'),
         near=pixels.get('near'),
         far=pixels.get('far'),
@@ -609,7 +598,7 @@ def cast_pinhole_rays(camtoworld, height, width, focal, near, far):
     pix_x_int, pix_y_int = pixel_coordinates(width, height)
     pixtocam = get_pixtocam(focal, width, height)
 
-    origins, directions, viewdirs, radii, imageplane = pixels_to_rays(pix_x_int, pix_y_int, pixtocam, camtoworld)
+    origins, directions, radii = pixels_to_rays(pix_x_int, pix_y_int, pixtocam, camtoworld)
 
     broadcast_scalar = lambda x: np.broadcast_to(x, pix_x_int.shape)[..., None]
     ray_kwargs = {
@@ -621,9 +610,7 @@ def cast_pinhole_rays(camtoworld, height, width, focal, near, far):
 
     return dict(origins=origins,
                 directions=directions,
-                viewdirs=viewdirs,
                 radii=radii,
-                imageplane=imageplane,
                 **ray_kwargs)
 
 
@@ -655,8 +642,6 @@ def cast_spherical_rays(camtoworld, height, width, near, far):
     dy_norm = np.linalg.norm(dy, axis=-1)
     radii = (0.5 * (dx_norm + dy_norm))[..., None] * 2 / np.sqrt(12)
 
-    imageplane = np.zeros_like(directions[..., :2])
-
     broadcast_scalar = lambda x: np.broadcast_to(x, radii.shape[:-1])[..., None]
     ray_kwargs = {
         'lossmult': broadcast_scalar(1.),
@@ -667,7 +652,5 @@ def cast_spherical_rays(camtoworld, height, width, near, far):
 
     return dict(origins=origins,
                 directions=directions,
-                viewdirs=viewdirs,
                 radii=radii,
-                imageplane=imageplane,
                 **ray_kwargs)

@@ -224,7 +224,6 @@ class Model(nn.Module):
                 means, stds,
                 self.scene_radius,
                 viewdirs=t_dirs if self.use_viewdirs else None,
-                imageplane=batch.get('imageplane'),
                 glo_vec=None if is_prop else glo_vec,
                 exposure=batch.get('exposure_values'),
             )
@@ -578,7 +577,6 @@ class MLP(nn.Module):
                 means, stds,
                 scene_radius,
                 viewdirs=None,
-                imageplane=None,
                 glo_vec=None,
                 exposure=None,
                 no_warp=False):
@@ -593,9 +591,6 @@ class MLP(nn.Module):
         output vector of the first part of the MLP. If None, only the first part
         of the MLP will be used with input x. In the original paper, this
         variable is the view direction.
-      imageplane:[batch, 2], xy image plane coordinates
-        for each ray in the batch. Useful for image plane operations such as a
-        learned vignette mapping.
       glo_vec: [..., num_glo_features], The GLO vector for each ray.
       exposure: [..., 1], exposure value (shutter_speed * ISO) for each ray.
 
