@@ -238,7 +238,7 @@ def cast_rays_acc(t0, t1, origins, directions, radii, rand=True, std_scale=0.5):
     means = math.matmul(means, basis_matrix.transpose(-1, -2))
     means = means + torch.broadcast_to(origins[..., None, :], means.shape)
 
-    return means, stds
+    return means, stds, t
 
 
 def compute_alpha_weights(density, tdist, dirs, opaque_background=False):

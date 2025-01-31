@@ -5,6 +5,8 @@ Config.far = 6
 Config.factor = 0
 Config.hash_decay_mults = 10
 Config.train_render_every = 900000
+Config.checkpoint_every = 20000
+Config.checkpoints_total_limit = 4
 
 Config.batch_size = 4096
 Config.render_chunk_size = 32768
@@ -15,6 +17,8 @@ Config.lr_final = 0.0005
 
 Config.anti_interlevel_loss_mult = 0
 Config.distortion_loss_mult = 0.005
+Config.gradient_scaling = True
+Config.near_far_planes = False
 
 Model.raydist_fn = None
 Model.num_levels = 1

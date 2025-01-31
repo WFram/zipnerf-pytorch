@@ -201,6 +201,8 @@ class Model(nn.Module):
                 ray_indices, t_starts, t_ends = self.occupancy_grid_estimator[i_level].sampling(
                     batch['origins'][:, 0, 0] if len(batch['origins'].shape) == 4 else batch['origins'],
                     batch['directions'][:, 0, 0] if len(batch['directions'].shape) == 4 else batch['directions'],
+                    near_plane=torch.mean(batch['near']) if self.config.near_far_planes else 0.0,
+                    far_plane=torch.mean(batch['far']) if self.config.near_far_planes else 1e10,
                     sigma_fn=sigma_fn,
                     render_step_size=self.render_step_size[i_level],
                     stratified=True,
@@ -210,10 +212,10 @@ class Model(nn.Module):
             ray_indices = ray_indices.long()
             t_origins = batch['origins'][:, 0, 0][ray_indices] if len(batch['origins'].shape) == 4 else batch['origins'][ray_indices]
             t_dirs = batch['directions'][:, 0, 0][ray_indices] if len(batch['directions'].shape) == 4 else batch['directions'][ray_indices]
-            means, stds = render.cast_rays_acc(t_starts, t_ends,
-                                               t_origins, t_dirs, 
-                                               batch['radii'][:, 0, 0][ray_indices] if len(batch['radii'].shape) == 4 else batch['radii'][ray_indices],
-                                               rand, std_scale=self.std_scale)
+            means, stds, ts = render.cast_rays_acc(t_starts, t_ends,
+                                                   t_origins, t_dirs, 
+                                                   batch['radii'][:, 0, 0][ray_indices] if len(batch['radii'].shape) == 4 else batch['radii'][ray_indices],
+                                                   rand, std_scale=self.std_scale)
             midpoints = (t_starts + t_ends)[..., None] / 2.0
             intervals = (t_ends - t_starts)[..., None]
 
@@ -226,6 +228,9 @@ class Model(nn.Module):
                 glo_vec=None if is_prop else glo_vec,
                 exposure=batch.get('exposure_values'),
             )
+            if self.config.gradient_scaling:
+                ray_results['rgb'], ray_results['density'] = train_utils.GradientScaler.apply(
+                    ray_results['rgb'], ray_results['density'], ts.mean(dim=-1))
 
             n_rays = batch['origins'].shape[0]
             weights, _, _ = render_weight_from_density(t_starts, t_ends, ray_results['density'], ray_indices=ray_indices, n_rays=n_rays)

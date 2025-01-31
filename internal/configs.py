@@ -66,6 +66,7 @@ class Config:
     resume_from_checkpoint: bool = True  # whether to resume from checkpoint.
     checkpoints_total_limit: int = 1
     gradient_scaling: bool = False  # If True, scale gradients as in https://gradient-scaling.github.io/.
+    near_far_planes: bool = False  # If True, use near and far planes in order to samples rays
     print_every: int = 100  # The number of steps between reports to tensorboard.
     train_render_every: int = 500  # Steps between test set renders when training
     data_loss_type: str = 'charb'  # What kind of loss to use ('mse' or 'charb').
