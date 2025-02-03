@@ -475,7 +475,8 @@ class Blender(Dataset):
         disp_images = []
         normal_images = []
         cams = []
-        mean_camera_angle_x = np.mean(np.array([frame['camera_angle_x'] for frame in meta['frames']]))
+        mean_camera_angle_x = np.mean(np.array([frame['camera_angle_x'] for frame in meta['frames']])) \
+            if meta.get('camera_angle_x', None) is None else meta['camera_angle_x']
         for idx, frame in enumerate(tqdm(meta['frames'], desc='Loading Blender dataset', leave=False)):
             fprefix = os.path.join(self.data_dir, frame['file_path'])
 
