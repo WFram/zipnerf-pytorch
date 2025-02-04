@@ -477,6 +477,8 @@ class Blender(Dataset):
         cams = []
         mean_camera_angle_x = np.mean(np.array([frame['camera_angle_x'] for frame in meta['frames']])) \
             if meta.get('camera_angle_x', None) is None else meta['camera_angle_x']
+        POSE_SCALER = 10
+        print(f'Poses will be scaled by {POSE_SCALER}')
         for idx, frame in enumerate(tqdm(meta['frames'], desc='Loading Blender dataset', leave=False)):
             fprefix = os.path.join(self.data_dir, frame['file_path'])
 
@@ -502,6 +504,7 @@ class Blender(Dataset):
                 normal_images.append(normal_image)
 
             cams.append(np.array(frame['transform_matrix'], dtype=np.float32))
+            cams[-1][:3, 3] *= POSE_SCALER
 
         self.images = np.stack(images, axis=0)
         if self._load_disps:
