@@ -17,6 +17,7 @@ from nerfacc import OccGridEstimator, render_weight_from_density
 from omegaconf import OmegaConf
 from torch.utils._pytree import tree_map
 from tqdm import tqdm
+from dataclasses import dataclass
 from gridencoder import GridEncoder
 from torch.autograd import Function
 from torch.cuda.amp import custom_bwd, custom_fwd
@@ -150,15 +151,6 @@ class Model(nn.Module):
       ret: list, [*(rgb, distance, acc)]
     """
         device = batch['origins'].device
-        if self.num_glo_features > 0:
-            if not zero_glo:
-                # Construct/grab GLO vectors for the cameras of each input ray.
-                cam_idx = batch['cam_idx'][..., 0]
-                glo_vec = self.glo_vecs(cam_idx.long())
-            else:
-                glo_vec = torch.zeros(batch['origins'].shape[:-1] + (self.num_glo_features,), device=device)
-        else:
-            glo_vec = None
 
         ray_history = []
         renderings = []
@@ -173,10 +165,7 @@ class Model(nn.Module):
             def occ_eval_fn(x):
                 stds = torch.from_numpy(np.zeros_like(x[..., 0].cpu())).cuda()
                 raw_density, _, _ = mlp.predict_density(x, stds, self.scene_radius, rand=rand)
-                if mlp.use_fully_fused_mlp:
-                    density = trunc_exp(raw_density + mlp.density_bias)
-                else:
-                    density = F.softplus(raw_density + mlp.density_bias)
+                density = trunc_exp(raw_density + mlp.density_bias)
                 # approximate for 1 - torch.exp(-density[...,None] * self.render_step_size) based on taylor series
                 self.render_step_size[i_level] = 1.732 * 2 * self.scene_radius / num_samples
                 return density[...,None] * self.render_step_size[i_level]
@@ -191,10 +180,7 @@ class Model(nn.Module):
                 positions = t_origins + t_dirs * (t_starts[..., None] + t_ends[..., None]) / 2.
                 stds = torch.from_numpy(np.zeros_like(positions[..., 0].cpu())).cuda()
                 raw_density, _, _ = mlp.predict_density(positions, stds, self.scene_radius, rand=rand)
-                if mlp.use_fully_fused_mlp:
-                    density = trunc_exp(raw_density + mlp.density_bias)
-                else:
-                    density = F.softplus(raw_density + mlp.density_bias)
+                density = trunc_exp(raw_density + mlp.density_bias)
                 return density
 
             with torch.no_grad():
@@ -224,7 +210,7 @@ class Model(nn.Module):
                 means, stds,
                 self.scene_radius,
                 viewdirs=t_dirs if self.use_viewdirs else None,
-                glo_vec=None if is_prop else glo_vec,
+                glo_vec=None,
                 exposure=batch.get('exposure_values'),
             )
             if self.config.gradient_scaling:
@@ -334,24 +320,6 @@ def omega_config_to_primitive(config, resolve=True):
     return OmegaConf.to_container(config, resolve=resolve) 
 
 
-class _TruncExp(Function):  # pylint: disable=abstract-method
-    # Implementation from torch-ngp:
-    # https://github.com/ashawkey/torch-ngp/blob/93b08a0d4ec1cc6e69d85df7f0acdfb99603b628/activation.py
-    @staticmethod
-    @custom_fwd(cast_inputs=torch.float32)
-    def forward(ctx, x):  # pylint: disable=arguments-differ
-        ctx.save_for_backward(x)
-        return torch.exp(x)
-
-    @staticmethod
-    @custom_bwd
-    def backward(ctx, g):  # pylint: disable=arguments-differ
-        x = ctx.saved_tensors[0]
-        return g * torch.exp(torch.clamp(x, max=15))
-
-trunc_exp = _TruncExp.apply
-
-
 class MLP(nn.Module):
     """A PosEnc MLP."""
     bottleneck_width: int = 128  # The width of the bottleneck vector.
@@ -390,68 +358,73 @@ class MLP(nn.Module):
     net_width_glo: int = 128  # The width of the second part of MLP.
     net_depth_glo: int = 2  # The width of the second part of MLP.
     use_fully_fused_mlp: bool = False  # Usage of fully-fused MLP.
-    ffmlp_config: str = ''  # Path to YAML file with fully-fused MLP config.
+    tinycudann_config: str = ''  # Path to YAML file with fully-fused MLP config.
 
     def __init__(self, **kwargs):
         super().__init__()
         set_kwargs(self, kwargs)
-        # Make sure that normals are computed if reflection direction is used.
-        if self.use_reflections and not (self.enable_pred_normals or
-                                         not self.disable_density_normals):
-            raise ValueError('Normals must be computed for reflection directions.')
+
+        tinycudann_config = load_omega_config(self.tinycudann_config)
+        density_config = tinycudann_config.get('density')
+        rgb_config = tinycudann_config.get('rgb')
+        feature_encoding_config = density_config.get('xyz_encoding_config')
+        
+        @dataclass
+        class XyzEncodingParams():
+            num_levels: int
+            level_dim: int
+            log2_hashmap_size: int
+            base_resolution: int
+            per_level_scale: int
+            grid_sizes: torch.Tensor = torch.from_numpy(np.array([], dtype=np.int32))
+        
+        self.xyz_encoding_params = XyzEncodingParams(feature_encoding_config.get('n_levels', 6),
+                                                     feature_encoding_config.get('n_features_per_level'),
+                                                     feature_encoding_config.get('log2_hashmap_size'),
+                                                     feature_encoding_config.get('base_resolution'),
+                                                     feature_encoding_config.get('per_level_scale'))
+            
+        # self.xyz_encoding_params.num_levels = int(
+        #     np.log(self.grid_disired_resolution / self.xyz_encoding_params.base_resolution) / np.log(self.grid_level_interval)) + 1
+        # feature_encoding_config['n_levels'] = self.xyz_encoding_params.num_levels
+
+        self.xyz_encoding_params.num_levels = feature_encoding_config['n_levels']
+
+        last_dim = self.xyz_encoding_params.num_levels * self.xyz_encoding_params.level_dim
+        resolutions = [int(np.ceil(self.xyz_encoding_params.base_resolution * self.xyz_encoding_params.per_level_scale ** (i // self.xyz_encoding_params.level_dim))) + 1 \
+                       for i in range(self.xyz_encoding_params.num_levels * self.xyz_encoding_params.level_dim)]
+        self.xyz_encoding_params.grid_sizes = torch.from_numpy(np.array(resolutions, dtype=np.int32)).cuda()
+
+        with torch.cuda.device(get_rank()):
+            self.feature_encoding_n_input = 3
+            self.encoder = tcnn.Encoding(self.feature_encoding_n_input, omega_config_to_primitive(feature_encoding_config))
+
+        dir_encoding_config = rgb_config.get('dir_encoding_config')
+        dir_encoding_n_input = 3
+        self.dir_enc_fn = tcnn.Encoding(dir_encoding_n_input, omega_config_to_primitive(dir_encoding_config))
+        self.density_layer_n_input_dims = last_dim
+        self.density_layer_n_output_dims = 1 if self.disable_rgb else self.bottleneck_width
+        dim_dir_enc = self.dir_enc_fn(torch.zeros(1, 3).cuda()).shape[-1]
+        last_dim_rgb = self.bottleneck_width + dim_dir_enc
 
         if not self.use_fully_fused_mlp:
-            # Precompute and define viewdir or refdir encoding function.
-            if self.use_directional_enc:
-                self.dir_enc_fn = ref_utils.generate_ide_fn(self.deg_view)
-                dim_dir_enc = self.dir_enc_fn(torch.zeros(1, 3), torch.zeros(1, 1)).shape[-1]
-            else:
-
-                def dir_enc_fn(direction, _):
-                    return coord.pos_enc(
-                        direction, min_deg=0, max_deg=self.deg_view, append_identity=True)
-
-                self.dir_enc_fn = dir_enc_fn
-                dim_dir_enc = self.dir_enc_fn(torch.zeros(1, 3), None).shape[-1]
-            self.grid_num_levels = int(
-                np.log(self.grid_disired_resolution / self.grid_base_resolution) / np.log(self.grid_level_interval)) + 1
-            self.encoder = GridEncoder(input_dim=3,
-                                    num_levels=self.grid_num_levels,
-                                    level_dim=self.grid_level_dim,
-                                    base_resolution=self.grid_base_resolution,
-                                    desired_resolution=self.grid_disired_resolution,
-                                    log2_hashmap_size=self.grid_log2_hashmap_size,
-                                    gridtype='hash',
-                                    align_corners=False)
-            last_dim = self.encoder.output_dim
-            if self.scale_featurization:
-                last_dim += self.encoder.num_levels
-        
-            self.density_layer = nn.Sequential(nn.Linear(last_dim, 64),
+            self.density_layer = nn.Sequential(nn.Linear(self.density_layer_n_input_dims, 64),
                                                nn.ReLU(),
                                                nn.Linear(64,
-                                                         1 if self.disable_rgb else self.bottleneck_width))  # Hardcoded to a single channel.
-            last_dim = 1 if self.disable_rgb and not self.enable_pred_normals else self.bottleneck_width
+                                                         self.density_layer_n_output_dims))  # Hardcoded to a single channel.
+            self.density_layer_n_output_dims = 1 if self.disable_rgb and not self.enable_pred_normals else self.bottleneck_width
             if self.enable_pred_normals:
-                self.normal_layer = nn.Linear(last_dim, 3)
+                self.normal_layer = nn.Linear(self.density_layer_n_output_dims, 3)
 
             if not self.disable_rgb:
                 if self.use_diffuse_color:
-                    self.diffuse_layer = nn.Linear(last_dim, self.num_rgb_channels)
+                    self.diffuse_layer = nn.Linear(self.density_layer_n_output_dims, self.num_rgb_channels)
 
                 if self.use_specular_tint:
-                    self.specular_layer = nn.Linear(last_dim, 3)
+                    self.specular_layer = nn.Linear(self.density_layer_n_output_dims, 3)
 
                 if self.enable_pred_roughness:
-                    self.roughness_layer = nn.Linear(last_dim, 1)
-
-                # Output of the first part of MLP.
-                if self.bottleneck_width > 0:
-                    last_dim_rgb = self.bottleneck_width
-                else:
-                    last_dim_rgb = 0
-
-                last_dim_rgb += dim_dir_enc
+                    self.roughness_layer = nn.Linear(self.density_layer_n_output_dims, 1)
 
                 if self.use_n_dot_v:
                     last_dim_rgb += 1
@@ -474,103 +447,32 @@ class MLP(nn.Module):
                         last_dim_rgb += input_dim_rgb
                 self.rgb_layer = nn.Linear(last_dim_rgb, self.num_rgb_channels)
         else:
-            ffmlp_config = load_omega_config(self.ffmlp_config)
-            density_config = ffmlp_config.get('density')
-            rgb_config = ffmlp_config.get('rgb')
-            
-            from dataclasses import dataclass
-            feature_encoding_config = density_config.get('xyz_encoding_config')
-            @dataclass
-            class XyzEncodingParams():
-                num_levels: int
-                level_dim: int
-                log2_hashmap_size: int
-                base_resolution: int
-                per_level_scale: int
-                grid_sizes: torch.Tensor = torch.from_numpy(np.array([], dtype=np.int32))
-            self.xyz_encoding_params = XyzEncodingParams(feature_encoding_config.get('n_levels', 6),
-                                                         feature_encoding_config.get('n_features_per_level'),
-                                                         feature_encoding_config.get('log2_hashmap_size'),
-                                                         feature_encoding_config.get('base_resolution'),
-                                                         feature_encoding_config.get('per_level_scale'))
-            
-            # self.xyz_encoding_params.num_levels = int(
-            #     np.log(self.grid_disired_resolution / self.xyz_encoding_params.base_resolution) / np.log(self.grid_level_interval)) + 1
-            # feature_encoding_config['n_levels'] = self.xyz_encoding_params.num_levels
-
-            self.xyz_encoding_params.num_levels = feature_encoding_config['n_levels']
             density_mlp_config = density_config.get('mlp_network_config')
             assert self.bottleneck_width > 0
-            last_dim = self.xyz_encoding_params.num_levels * self.xyz_encoding_params.level_dim
-            resolutions = [int(np.ceil(self.xyz_encoding_params.base_resolution * self.xyz_encoding_params.per_level_scale ** (i // self.xyz_encoding_params.level_dim))) + 1 \
-                           for i in range(self.xyz_encoding_params.num_levels * self.xyz_encoding_params.level_dim)]
-            self.xyz_encoding_params.grid_sizes = torch.from_numpy(np.array(resolutions, dtype=np.int32)).cuda()
             
             with torch.cuda.device(get_rank()):
-                self.feature_encoding_n_input = 3
-                self.encoder = tcnn.Encoding(self.feature_encoding_n_input, omega_config_to_primitive(feature_encoding_config))
-                if self.scale_featurization:
-                    last_dim += self.xyz_encoding_params.num_levels
-                self.density_layer_n_input_dims = last_dim
-                self.density_layer_n_output_dims = 1 if self.disable_rgb else self.bottleneck_width
                 self.density_layer = tcnn.Network(self.density_layer_n_input_dims, self.density_layer_n_output_dims, omega_config_to_primitive(density_mlp_config))
                 if not self.disable_rgb:
                     rgb_mlp_config = rgb_config.get('mlp_network_config')
-                    dir_encoding_config = rgb_config.get('dir_encoding_config')
-                    dir_encoding_n_input = 3
-                    self.dir_enc_fn = tcnn.Encoding(dir_encoding_n_input, omega_config_to_primitive(dir_encoding_config))
-                    dim_dir_enc = self.dir_enc_fn(torch.zeros(1, 3).cuda()).shape[-1]
-                    last_dim_rgb = self.bottleneck_width + dim_dir_enc
                     self.rgb_layer_n_input_dims = last_dim_rgb
                     self.rgb_layer_n_output_dims = self.num_rgb_channels
                     self.rgb_layer = tcnn.Network(self.rgb_layer_n_input_dims, self.rgb_layer_n_output_dims, omega_config_to_primitive(rgb_mlp_config))
 
-    def predict_density(self, means, stds, scene_radius, rand=False, no_warp=False):
+    def predict_density(self, means, stds, scene_radius, rand=False):
         """Helper function to output density."""
         # Encode input positions
-        if not self.use_fully_fused_mlp and self.warp_fn is not None and not no_warp:
-            means, stds = coord.track_linearize(self.warp_fn, means, stds)
-            # contract [-2, 2] to [-1, 1]
-            bound = 2
-            means = means / bound
-            stds = stds / bound
-        else:
-            means, stds = coord.contract_to_unisphere(means, stds, scene_radius)
-        if not self.use_fully_fused_mlp:
-            if len(means.shape) == 2:
-                means = means[:, None]
-                stds = stds[:, None]
-            features = self.encoder(means, bound=1).unflatten(-1, (self.encoder.num_levels, -1))
-            weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.encoder.grid_sizes ** 2))
-            features = (features * weights[..., None]).mean(dim=-3).flatten(-2, -1)
-            if self.scale_featurization:
-                with torch.no_grad():
-                    vl2mean = segment_coo((self.encoder.embeddings ** 2).sum(-1),
-                                        self.encoder.idx,
-                                        torch.zeros(self.grid_num_levels, device=weights.device),
-                                        self.grid_num_levels,
-                                        reduce='mean'
-                                        )
-                featurized_w = (2 * weights.mean(dim=-2) - 1) * (self.encoder.init_std ** 2 + vl2mean).sqrt()
-                features = torch.cat([features, featurized_w], dim=-1)
-            x = self.density_layer(features)
-            raw_density = x[..., 0]  # Hardcoded to a single channel.
-            # Add noise to regularize the density predictions if needed.
-            if rand and (self.density_noise > 0):
-                raw_density += self.density_noise * torch.randn_like(raw_density)
-            return raw_density, x, means.mean(dim=-2)
-        else:
-            features = self.encoder(means.view(-1, self.feature_encoding_n_input)).view(*means.shape[:-1], self.density_layer_n_input_dims).float()
-            if len(features.shape) > 2:
-                # weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.xyz_encoding_params.grid_sizes ** 2))
-                weights = torch.ones_like(features)
-                features = (features * weights).mean(dim=-2)
-            x = self.density_layer(features.view(-1, self.density_layer_n_input_dims)).view(*features.shape[:-1], self.density_layer_n_output_dims).float()
-            raw_density = x[..., 0]  # Hardcoded to a single channel.
-            # Add noise to regularize the density predictions if needed.
-            if rand and (self.density_noise > 0):
-                raw_density += self.density_noise * torch.randn_like(raw_density)
-            return raw_density, x, means.mean(dim=-2)
+        means, stds = coord.contract_to_unisphere(means, stds, scene_radius)
+        features = self.encoder(means.view(-1, self.feature_encoding_n_input)).view(*means.shape[:-1], self.density_layer_n_input_dims).float()
+        if len(features.shape) > 2:
+            # weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.xyz_encoding_params.grid_sizes ** 2))
+            weights = torch.ones_like(features)
+            features = (features * weights).mean(dim=-2)
+        x = self.density_layer(features.view(-1, self.density_layer_n_input_dims)).view(*features.shape[:-1], self.density_layer_n_output_dims).float()
+        raw_density = x[..., 0]  # Hardcoded to a single channel.
+        # Add noise to regularize the density predictions if needed.
+        if rand and (self.density_noise > 0):
+            raw_density += self.density_noise * torch.randn_like(raw_density)
+        return raw_density, x, means.mean(dim=-2)
 
     def forward(self,
                 rand,
@@ -578,8 +480,7 @@ class MLP(nn.Module):
                 scene_radius,
                 viewdirs=None,
                 glo_vec=None,
-                exposure=None,
-                no_warp=False):
+                exposure=None):
         """Evaluate the MLP.
 
     Args:
@@ -602,13 +503,13 @@ class MLP(nn.Module):
       roughness: [..., 1], or None.
     """
         if self.disable_density_normals:
-            raw_density, x, means_contract = self.predict_density(means, stds, scene_radius, rand=rand, no_warp=no_warp)
+            raw_density, x, means_contract = self.predict_density(means, stds, scene_radius, rand=rand)
             raw_grad_density = None
             normals = None
         else:
             with torch.enable_grad():
                 means.requires_grad_(True)
-                raw_density, x, means_contract = self.predict_density(means, stds, scene_radius, rand=rand, no_warp=no_warp)
+                raw_density, x, means_contract = self.predict_density(means, stds, scene_radius, rand=rand)
                 d_output = torch.ones_like(raw_density, requires_grad=False, device=raw_density.device)
                 raw_grad_density = torch.autograd.grad(
                     outputs=raw_density,
@@ -636,10 +537,7 @@ class MLP(nn.Module):
             normals_to_use = normals
 
         # Apply bias and activation to raw density
-        if self.use_fully_fused_mlp:
-            density = trunc_exp(raw_density + self.density_bias)
-        else:
-            density = F.softplus(raw_density + self.density_bias)
+        density = trunc_exp(raw_density + self.density_bias)
 
         roughness = None
         if self.disable_rgb:
@@ -658,68 +556,33 @@ class MLP(nn.Module):
                     roughness = (F.softplus(raw_roughness + self.roughness_bias))
 
                 # Output of the first part of MLP.
-                if self.bottleneck_width > 0:
-                    bottleneck = x
-                    # Add bottleneck noise.
-                    if rand and (self.bottleneck_noise > 0):
-                        bottleneck += self.bottleneck_noise * torch.randn_like(bottleneck)
+                bottleneck = x
+                # Add bottleneck noise.
+                if rand and (self.bottleneck_noise > 0):
+                    bottleneck += self.bottleneck_noise * torch.randn_like(bottleneck)
 
-                    # Append GLO vector if used.
-                    if glo_vec is not None:
-                        for i in range(self.net_depth_glo):
-                            glo_vec = self.get_submodule(f"lin_glo_{i}")(glo_vec)
-                            if i != self.net_depth_glo - 1:
-                                glo_vec = F.relu(glo_vec)
-                        glo_vec = torch.broadcast_to(glo_vec[..., None, :],
-                                                     bottleneck.shape[:-1] + glo_vec.shape[-1:])
-                        scale, shift = glo_vec.chunk(2, dim=-1)
-                        bottleneck = bottleneck * torch.exp(scale) + shift
+                viewdirs_scaled = (viewdirs + 1.) / 2.
+                dir_enc = self.dir_enc_fn(viewdirs_scaled.view(-1, 3))
+                network_inp = torch.cat([bottleneck.view(-1, bottleneck.shape[-1]), dir_enc], dim=-1)
 
-                    x = [bottleneck]
-                else:
-                    x = []
-
-                # Encode view (or reflection) directions.
-                dir_enc = None
-                if self.use_reflections:
-                    # Compute reflection directions. Note that we flip viewdirs before
-                    # reflecting, because they point from the camera to the point,
-                    # whereas ref_utils.reflect() assumes they point toward the camera.
-                    # Returned refdirs then point from the point to the environment.
-                    refdirs = ref_utils.reflect(-viewdirs[..., None, :], normals_to_use)
-                    # Encode reflection directions.
-                    dir_enc = self.dir_enc_fn(refdirs, roughness)
-                else:
-                    # Encode view directions.
-                    if not self.use_fully_fused_mlp:
-                        dir_enc = self.dir_enc_fn(viewdirs, roughness)
-                    else:
-                        viewdirs_scaled = (viewdirs + 1.) / 2.
-                        dir_enc = self.dir_enc_fn(viewdirs_scaled.view(-1, 3))
-
-                if not self.use_fully_fused_mlp:    
-
-
-
-
-                    x = torch.cat([bottleneck.view(-1, bottleneck.shape[-1]), dir_enc], dim=-1)
+                if not self.use_fully_fused_mlp:
+                    x = network_inp
                     inputs = x
                     for i in range(self.net_depth_viewdirs):
                         x = self.get_submodule(f"lin_second_stage_{i}")(x)
                         x = F.relu(x)
                         if i == self.skip_layer_dir:
                             x = torch.cat([x, inputs], dim=-1)
-            # If using diffuse/specular colors, then `rgb` is treated as linear
-            # specular color. Otherwise it's treated as the color itself.
-            if self.use_fully_fused_mlp:
-                network_inp = torch.cat([bottleneck.view(-1, bottleneck.shape[-1]), dir_enc], dim=-1)
-                rgb = torch.sigmoid(self.rgb_premultiplier *
-                                    self.rgb_layer(network_inp).view(*bottleneck.shape[:-1], self.rgb_layer_n_output_dims).float() +
-                                    self.rgb_bias)
-            else:
-                rgb = torch.sigmoid(self.rgb_premultiplier *
-                                    self.rgb_layer(x) +
-                                    self.rgb_bias)
+                # If using diffuse/specular colors, then `rgb` is treated as linear
+                # specular color. Otherwise it's treated as the color itself.
+                if self.use_fully_fused_mlp:
+                    rgb = torch.sigmoid(self.rgb_premultiplier *
+                                        self.rgb_layer(network_inp).view(*bottleneck.shape[:-1], self.rgb_layer_n_output_dims).float() +
+                                        self.rgb_bias)
+                else:
+                    rgb = torch.sigmoid(self.rgb_premultiplier *
+                                        self.rgb_layer(x) +
+                                        self.rgb_bias)
 
             if self.use_diffuse_color:
                 # Initialize linear diffuse color around 0.25, so that the combined
