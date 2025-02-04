@@ -323,9 +323,14 @@ def omega_config_to_primitive(config, resolve=True):
 class MLP(nn.Module):
     """A PosEnc MLP."""
     bottleneck_width: int = 128  # The width of the bottleneck vector.
-    net_depth_viewdirs: int = 2  # The depth of the second part of ML.
+    net_depth_xyz: int = 1  # The depth of the first part of MLP.
+    net_width_xyz: int = 64  # The width of the first part of MLP.
+    net_depth_viewdirs: int = 2  # The depth of the second part of MLP.
     net_width_viewdirs: int = 128  # The width of the second part of MLP.
+    skip_layer_xyz: int = 1000  # Add a skip connection to 1st MLP after Nth layers.
     skip_layer_dir: int = 1000  # Add a skip connection to 2nd MLP after Nth layers.
+    skip_each_layer_xyz: bool = False  # Add skip connections to 1st MLP after each layers.
+    skip_each_layer_dir: bool = False  # Add skip connections to 2nd MLP after each layers.
     num_rgb_channels: int = 3  # The number of RGB channels.
     deg_view: int = 4  # Degree of encoding for viewdirs or refdirs.
     use_reflections: bool = False  # If True, use refdirs instead of viewdirs.
@@ -408,10 +413,17 @@ class MLP(nn.Module):
         last_dim_rgb = self.bottleneck_width + dim_dir_enc
 
         if not self.use_fully_fused_mlp:
-            self.density_layer = nn.Sequential(nn.Linear(self.density_layer_n_input_dims, 64),
-                                               nn.ReLU(),
-                                               nn.Linear(64,
-                                                         self.density_layer_n_output_dims))  # Hardcoded to a single channel.
+            last_dim_density = self.density_layer_n_input_dims
+            input_dim_density = last_dim_density
+            for i in range(self.net_depth_xyz):
+                lin = nn.Linear(last_dim_density, self.net_width_xyz)
+                torch.nn.init.kaiming_uniform_(lin.weight)
+                self.register_module(f"lin_first_stage_{i}", lin)
+                last_dim_density = self.net_width_xyz
+                if self.skip_each_layer_xyz or i == self.skip_layer_xyz:
+                    last_dim_density += input_dim_density
+            self.density_layer = nn.Linear(last_dim_density,
+                                           self.density_layer_n_output_dims)  # Hardcoded to a single channel.
             self.density_layer_n_output_dims = 1 if self.disable_rgb and not self.enable_pred_normals else self.bottleneck_width
             if self.enable_pred_normals:
                 self.normal_layer = nn.Linear(self.density_layer_n_output_dims, 3)
@@ -443,7 +455,7 @@ class MLP(nn.Module):
                     torch.nn.init.kaiming_uniform_(lin.weight)
                     self.register_module(f"lin_second_stage_{i}", lin)
                     last_dim_rgb = self.net_width_viewdirs
-                    if i == self.skip_layer_dir:
+                    if self.skip_each_layer_dir or i == self.skip_layer_dir:
                         last_dim_rgb += input_dim_rgb
                 self.rgb_layer = nn.Linear(last_dim_rgb, self.num_rgb_channels)
         else:
@@ -467,7 +479,17 @@ class MLP(nn.Module):
             # weights = torch.erf(1 / torch.sqrt(8 * stds[..., None] ** 2 * self.xyz_encoding_params.grid_sizes ** 2))
             weights = torch.ones_like(features)
             features = (features * weights).mean(dim=-2)
-        x = self.density_layer(features.view(-1, self.density_layer_n_input_dims)).view(*features.shape[:-1], self.density_layer_n_output_dims).float()
+        if self.use_fully_fused_mlp:
+            x = self.density_layer(features.view(-1, self.density_layer_n_input_dims)).view(*features.shape[:-1], self.density_layer_n_output_dims).float()
+        else:
+            x = features.view(-1, self.density_layer_n_input_dims)
+            inputs = x
+            for i in range(self.net_depth_xyz):
+                x = self.get_submodule(f"lin_first_stage_{i}")(x)
+                x = F.relu(x)
+                if self.skip_each_layer_xyz or i == self.skip_layer_xyz:
+                    x = torch.cat([x, inputs], dim=-1)
+            x = self.density_layer(x.view(-1, self.net_width_xyz + self.density_layer_n_input_dims)).view(*x.shape[:-1], self.density_layer_n_output_dims).float()
         raw_density = x[..., 0]  # Hardcoded to a single channel.
         # Add noise to regularize the density predictions if needed.
         if rand and (self.density_noise > 0):
@@ -571,7 +593,7 @@ class MLP(nn.Module):
                     for i in range(self.net_depth_viewdirs):
                         x = self.get_submodule(f"lin_second_stage_{i}")(x)
                         x = F.relu(x)
-                        if i == self.skip_layer_dir:
+                        if self.skip_each_layer_dir or i == self.skip_layer_dir:
                             x = torch.cat([x, inputs], dim=-1)
                 # If using diffuse/specular colors, then `rgb` is treated as linear
                 # specular color. Otherwise it's treated as the color itself.
