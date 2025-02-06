@@ -235,7 +235,8 @@ class Dataset(torch.utils.data.Dataset):
 
         # Initialize attributes
         self._patch_size = max(config.patch_size, 1)
-        self._batch_size = config.batch_size
+        self._batch_size = config.init_batch_size
+        self._target_batch_size = config.target_batch_size
         if self._patch_size ** 2 > self._batch_size:
             raise ValueError(f'Patch size {self._patch_size}^2 too large for ' +
                              f'per-process batch size {self._batch_size}')
@@ -310,6 +311,10 @@ class Dataset(torch.utils.data.Dataset):
     @property
     def size(self):
         return self._n_examples
+    
+    @property
+    def batch_size(self):
+        return self._batch_size
 
     def __len__(self):
         if self.split == utils.DataSplit.TRAIN and not self.config.compute_visibility:
@@ -449,6 +454,9 @@ class Dataset(torch.utils.data.Dataset):
             pix_x_int, pix_y_int = camera_utils.pixel_coordinates(
                 self.width, self.height)
             return self._make_ray_batch(pix_x_int, pix_y_int, cam_idx)
+
+    def update_batch_size(self, num_samples: int):
+        self._batch_size = int(self._batch_size * self._target_batch_size / float(num_samples))
 
     def _next_test(self, item):
         """Sample next test batch (one full image)."""

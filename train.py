@@ -57,18 +57,18 @@ def main(unused_argv):
     # load dataset
     dataset = datasets.load_dataset('train', config.data_dir, config)
     test_dataset = datasets.load_dataset('test', config.data_dir, config)
-    dataloader = torch.utils.data.DataLoader(np.arange(len(dataset)),
-                                             num_workers=8,
+    dataloader = torch.utils.data.DataLoader(dataset,
+                                             num_workers=0,
                                              shuffle=True,
                                              batch_size=1,
                                              collate_fn=dataset.collate_fn,
-                                             persistent_workers=True,
+                                             persistent_workers=False,
                                              )
-    test_dataloader = torch.utils.data.DataLoader(np.arange(len(test_dataset)),
-                                                  num_workers=4,
+    test_dataloader = torch.utils.data.DataLoader(test_dataset,
+                                                  num_workers=0,
                                                   shuffle=False,
                                                   batch_size=1,
-                                                  persistent_workers=True,
+                                                  persistent_workers=False,
                                                   collate_fn=test_dataset.collate_fn,
                                                   )
     if config.rawnerf_mode:
@@ -197,6 +197,8 @@ def main(unused_argv):
             train_utils.clip_gradients(model, config)
             optimizer.step()
 
+            dataset.update_batch_size(ray_history[-1]['ray_indices'].shape[0])
+
             stats['psnrs'] = image.mse_to_psnr(stats['mses'])
             stats['psnr'] = stats['psnrs'][-1]
 
@@ -207,7 +209,7 @@ def main(unused_argv):
             if step == init_step + 1 or step % config.print_every == 0:
                 elapsed_time = time.time() - train_start_time
                 steps_per_sec = config.print_every / elapsed_time
-                rays_per_sec = config.batch_size * steps_per_sec
+                rays_per_sec = dataset.batch_size * steps_per_sec
 
                 # A robust approximation of total training time, in case of pre-emption.
                 total_time += int(round(TIME_PRECISION * elapsed_time))
