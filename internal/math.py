@@ -50,12 +50,12 @@ def log_lerp(t, v0, v1):
     return np.exp(np.clip(t, 0, 1) * (lv1 - lv0) + lv0)
 
 
-def learning_rate_decay(step,
-                        lr_init,
-                        lr_final,
-                        max_steps,
-                        lr_delay_steps=0,
-                        lr_delay_mult=1):
+def continuous_learning_rate_decay(step,
+                                   lr_init,
+                                   lr_final,
+                                   max_steps,
+                                   lr_delay_steps=0,
+                                   lr_delay_mult=1):
     """Continuous learning rate decay function.
 
   The returned rate is lr_init when step=0 and lr_final when step=max_steps, and
@@ -83,6 +83,32 @@ def learning_rate_decay(step,
     else:
         delay_rate = 1.
     return delay_rate * log_lerp(step / max_steps, lr_init, lr_final)
+
+
+def discrete_learning_rate_decay(step,
+                                 lr_init,
+                                 milestones,
+                                 lr_decay_factor=0.33):
+    """Dicrete learning rate decay function.
+
+  The returned rate is lr_init when step < milestones[0], and it's decayed by lr_decay_factor
+  after each milestone.
+
+  Args:
+    step: int, the current optimization step.
+    lr_init: float, the initial learning rate.
+    milestones: list[int], the steps to recay the learning rate.
+    lr_decay_factor: float, learning rate decay factor
+
+  Returns:
+    lr: the learning for current step 'step'.
+  """
+    assert len(milestones) > 0, "No milestones provided for learning rate decay"
+    lr = lr_init
+    for milestone in milestones:
+        if milestone > step: break
+        lr *= lr_decay_factor
+    return lr
 
 
 def sorted_interp(x, xp, fp):

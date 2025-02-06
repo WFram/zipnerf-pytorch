@@ -265,7 +265,7 @@ def create_optimizer(config: configs.Config, model):
         'lr_delay_mult': config.lr_delay_mult,
     }
 
-    lr_fn_main = lambda step: math.learning_rate_decay(
+    lr_fn_main = lambda step: math.continuous_learning_rate_decay(
         step,
         lr_init=config.lr_init,
         lr_final=config.lr_final,

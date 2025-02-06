@@ -61,6 +61,7 @@ class Config:
 
     # Only used by train.py:
     max_steps: int = 25000  # The number of optimization steps.
+    milestones = [20000, 30000, 40000, 50000, 60000, 70000, 80000, 90000]  # The list of steps to decay the learning rate
     early_exit_steps: Optional[int] = None  # Early stopping, for debugging.
     checkpoint_every: int = 5000  # The number of steps to save a checkpoint.
     resume_from_checkpoint: bool = True  # whether to resume from checkpoint.
@@ -89,6 +90,7 @@ class Config:
     lr_final: float = 0.001  # The final learning rate.
     lr_delay_steps: int = 5000  # The number of "warmup" learning steps.
     lr_delay_mult: float = 1e-8  # How much sever the "warmup" should be.
+    lr_decay_factor: float = 0.33  # The decay factor for "milestones".
     adam_beta1: float = 0.9  # Adam's beta2 hyperparameter.
     adam_beta2: float = 0.99  # Adam's beta2 hyperparameter.
     adam_eps: float = 1e-15  # Adam's epsilon hyperparameter.
