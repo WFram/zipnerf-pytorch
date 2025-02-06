@@ -489,7 +489,10 @@ class MLP(nn.Module):
                 x = F.relu(x)
                 if self.skip_each_layer_xyz or i == self.skip_layer_xyz:
                     x = torch.cat([x, inputs], dim=-1)
-            x = self.density_layer(x.view(-1, self.net_width_xyz + self.density_layer_n_input_dims)).view(*x.shape[:-1], self.density_layer_n_output_dims).float()
+            hidden_dim = self.net_width_xyz
+            if self.skip_each_layer_xyz or self.net_depth_xyz - 1 == self.skip_layer_xyz:
+                hidden_dim += self.density_layer_n_input_dims
+            x = self.density_layer(x.view(-1, hidden_dim)).view(*x.shape[:-1], self.density_layer_n_output_dims).float()
         raw_density = x[..., 0]  # Hardcoded to a single channel.
         # Add noise to regularize the density predictions if needed.
         if rand and (self.density_noise > 0):
