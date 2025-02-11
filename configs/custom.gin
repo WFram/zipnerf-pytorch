@@ -8,7 +8,17 @@ Config.train_render_every = 900000
 Config.checkpoint_every = 20000
 Config.checkpoints_total_limit = 4
 
-Config.batch_size = 4096
+# Based on Zip-NeRF (G. Model Details)
+# Config.batch_size = 4096
+# Config.render_chunk_size = 32768
+# Config.max_steps = 100000
+# Config.lr_delay_steps = 20000
+# Config.lr_init = 0.0025
+# Config.lr_final = 0.00025
+
+# Based on iNGP
+Config.init_batch_size = 1024
+Config.target_batch_size = 262144
 Config.render_chunk_size = 32768
 Config.max_steps = 40000
 Config.lr_delay_steps = 20000

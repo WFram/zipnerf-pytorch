@@ -167,7 +167,6 @@ class Model(nn.Module):
                 raw_density, _, _ = mlp.predict_density(x, stds, self.scene_radius, rand=rand)
                 density = trunc_exp(raw_density + mlp.density_bias)
                 # approximate for 1 - torch.exp(-density[...,None] * self.render_step_size) based on taylor series
-                self.render_step_size[i_level] = 1.732 * 2 * self.scene_radius / num_samples
                 return density[...,None] * self.render_step_size[i_level]
 
             # TODO update only for training

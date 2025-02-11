@@ -26,7 +26,8 @@ class Config:
     seed = 0
     dataset_loader: str = 'llff'  # The type of dataset loader to use.
     batching: str = 'all_images'  # Batch composition, [single_image, all_images].
-    batch_size: int = 2 ** 16  # The number of rays/pixels in each batch.
+    init_batch_size: int = 2 ** 10  # The number of rays/pixels in each initial batch.
+    target_batch_size: int = 2 ** 18  # The number of rays/pixels in each batch to target.
     patch_size: int = 1  # Resolution of patches sampled for training batches.
     factor: int = 4  # The downsample factor of images, 0 for no downsampling.
     multiscale: bool = False  # use multiscale data for training.
